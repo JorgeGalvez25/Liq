@@ -243,8 +243,12 @@ type
     function ConsultarLiquidacionAPI(const AAccessToken, ATokenType: string;
       const AFechaIni, AFechaFin: TDateTime; const ANoTurno: Integer;
       var AJsonLiquidacion: string): Boolean;
-    procedure ConsultaLiquidacionAPIAlCerrarTurno(const AFechaIni, AFechaFin: TDateTime;
-      const ANoTurno: Integer);
+    function DameVolumenAjusteDGASAJUD2(const AEstacion: Integer;
+      const AFechaTurno: TDateTime; const ANoTurno, ANoCombustible: Integer): Double;
+    procedure AplicarAjusteDGASAJUD2Json(var AJsonLiquidacion: string;
+      const AEstacion: Integer; const AFechaTurno: TDateTime; const ANoTurno: Integer);
+    procedure ConsultaLiquidacionAPIAlCerrarTurno(const AFechaIni, AFechaFin, AFechaTurno: TDateTime;
+      const ANoTurno, AEstacion: Integer);
   public
     { Public declarations }
     procedure RefrescaTabla;
@@ -641,6 +645,62 @@ begin
   end;
 end;
 
+
+function LiqApiFechaJsonIgual(const AFechaJson: string; const AFechaTurno: TDateTime): Boolean;
+var
+  FechaJson: string;
+begin
+  FechaJson := Trim(AFechaJson);
+  if Length(FechaJson) >= 10 then
+    FechaJson := Copy(FechaJson, 1, 10);
+
+  Result := FechaJson = FormatDateTime('yyyy-mm-dd', AFechaTurno);
+end;
+
+function LiqApiDetalleCoincideAjuste(AObj: TlkJSONobject; const AFechaTurno: TDateTime;
+  const ANoTurno, ANoCombustible: Integer): Boolean;
+begin
+  Result := Assigned(AObj) and
+            (LiqApiJsonIntegerDef(AObj, 'noTurno', 0) = ANoTurno) and
+            (LiqApiJsonIntegerDef(AObj, 'noCombustible', 0) = ANoCombustible) and
+            LiqApiFechaJsonIgual(LiqApiJsonStringDef(AObj, 'fechaTurno', ''), AFechaTurno);
+end;
+
+function LiqApiCuentaManguerasAjuste(AJson: TlkJSONbase; const AFechaTurno: TDateTime;
+  const ANoTurno, ANoCombustible: Integer): Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  if not Assigned(AJson) then
+    Exit;
+
+  if AJson is TlkJSONlist then begin
+    for I := 0 to AJson.Count - 1 do begin
+      if (AJson.Child[I] is TlkJSONobject) and
+         LiqApiDetalleCoincideAjuste(TlkJSONobject(AJson.Child[I]), AFechaTurno, ANoTurno, ANoCombustible) then
+        Inc(Result);
+    end;
+  end
+  else if (AJson is TlkJSONobject) and
+          LiqApiDetalleCoincideAjuste(TlkJSONobject(AJson), AFechaTurno, ANoTurno, ANoCombustible) then
+    Result := 1;
+end;
+
+procedure LiqApiAsignaDiferenciaLecturas2(AObj: TlkJSONobject; const AValor: Double);
+var
+  Campo: TlkJSONbase;
+begin
+  if not Assigned(AObj) then
+    Exit;
+
+  Campo := AObj.Field['diferenciaLecturas2'];
+  if Assigned(Campo) then
+    Campo.Value := AValor
+  else
+    AObj.Add('diferenciaLecturas2', AValor);
+end;
+
 function TFLIQTURC.ConsultarLiquidacionAPI(const AAccessToken, ATokenType: string;
   const AFechaIni, AFechaFin: TDateTime; const ANoTurno: Integer;
   var AJsonLiquidacion: string): Boolean;
@@ -678,8 +738,96 @@ begin
   Result := True;
 end;
 
-procedure TFLIQTURC.ConsultaLiquidacionAPIAlCerrarTurno(const AFechaIni, AFechaFin: TDateTime;
-  const ANoTurno: Integer);
+
+function TFLIQTURC.DameVolumenAjusteDGASAJUD2(const AEstacion: Integer;
+  const AFechaTurno: TDateTime; const ANoTurno, ANoCombustible: Integer): Double;
+begin
+  Result := 0;
+
+  with DMGEN do begin
+    Q_Auxi.Close;
+    Q_Auxi.SQL.Clear;
+    Q_AuxiReal1.FieldKind := fkInternalCalc;
+    Q_Auxi.SQL.Add('select coalesce(sum(volumen),0) as Real1');
+    Q_Auxi.SQL.Add('from DGASAJUD2');
+    Q_Auxi.SQL.Add('where Estacion='+IntToStr(AEstacion));
+    Q_Auxi.SQL.Add('  and Fecha='+QuotedStr(FechaToStrSQL(AFechaTurno)));
+    Q_Auxi.SQL.Add('  and Turno='+IntToStr(ANoTurno));
+    Q_Auxi.SQL.Add('  and Combustible='+IntToStr(ANoCombustible));
+    Q_Auxi.Prepare;
+    Q_Auxi.Open;
+
+    try
+      if not Q_Auxi.IsEmpty then
+        Result := Q_AuxiReal1.AsFloat;
+    finally
+      Q_Auxi.Close;
+    end;
+  end;
+end;
+
+procedure TFLIQTURC.AplicarAjusteDGASAJUD2Json(var AJsonLiquidacion: string;
+  const AEstacion: Integer; const AFechaTurno: TDateTime; const ANoTurno: Integer);
+var
+  JsonBase: TlkJSONbase;
+  I: Integer;
+  Obj: TlkJSONobject;
+  NoCombustible: Integer;
+  CantidadMangueras: Integer;
+  VolumenAjuste: Double;
+  VolumenPorManguera: Double;
+
+  procedure AplicaObjeto(AObj: TlkJSONobject);
+  begin
+    if not Assigned(AObj) then
+      Exit;
+
+    if (LiqApiJsonIntegerDef(AObj, 'noTurno', 0) <> ANoTurno) or
+       not LiqApiFechaJsonIgual(LiqApiJsonStringDef(AObj, 'fechaTurno', ''), AFechaTurno) then
+      Exit;
+
+    NoCombustible := LiqApiJsonIntegerDef(AObj, 'noCombustible', 0);
+    if NoCombustible <= 0 then
+      Exit;
+
+    CantidadMangueras := LiqApiCuentaManguerasAjuste(JsonBase, AFechaTurno, ANoTurno, NoCombustible);
+    if CantidadMangueras <= 0 then
+      Exit;
+
+    VolumenAjuste := DameVolumenAjusteDGASAJUD2(AEstacion, AFechaTurno, ANoTurno, NoCombustible);
+    VolumenPorManguera := VolumenAjuste / CantidadMangueras;
+
+    LiqApiAsignaDiferenciaLecturas2(AObj, VolumenPorManguera);
+  end;
+
+begin
+  if Trim(AJsonLiquidacion) = '' then
+    Exit;
+
+  JsonBase := TlkJSON.ParseText(AJsonLiquidacion);
+  if not Assigned(JsonBase) then
+    raise Exception.Create('No fue posible parsear el JSON de liquidacion para aplicar DGASAJUD2.');
+
+  try
+    if JsonBase is TlkJSONlist then begin
+      for I := 0 to JsonBase.Count - 1 do begin
+        if JsonBase.Child[I] is TlkJSONobject then begin
+          Obj := TlkJSONobject(JsonBase.Child[I]);
+          AplicaObjeto(Obj);
+        end;
+      end;
+    end
+    else if JsonBase is TlkJSONobject then
+      AplicaObjeto(TlkJSONobject(JsonBase));
+
+    AJsonLiquidacion := TlkJSON.GenerateText(JsonBase);
+  finally
+    JsonBase.Free;
+  end;
+end;
+
+procedure TFLIQTURC.ConsultaLiquidacionAPIAlCerrarTurno(const AFechaIni, AFechaFin, AFechaTurno: TDateTime;
+  const ANoTurno, AEstacion: Integer);
 var
   AccessToken: string;
   TokenType: string;
@@ -688,6 +836,8 @@ begin
   if ObtenerTokenLiquidacionAPI(AccessToken, TokenType) then begin
     ConsultarLiquidacionAPI(AccessToken, TokenType, AFechaIni, AFechaFin,
       ANoTurno, JsonLiquidacion);
+
+    AplicarAjusteDGASAJUD2Json(JsonLiquidacion, AEstacion, AFechaTurno, ANoTurno);
 
     // Se conserva para devolverlo/enviarlo posteriormente sin cambiar su estructura.
     FJsonLiquidacionAPI := JsonLiquidacion;
@@ -2451,7 +2601,8 @@ begin
           FechaHoraFinAPI := LiqApiCombinaFechaHora(T_TurcFecha.AsDateTime, T_TurcHoraFin.AsDateTime);
 
           try
-            ConsultaLiquidacionAPIAlCerrarTurno(FechaHoraIniAPI, FechaHoraFinAPI, T_TurcTurno.AsInteger);
+            ConsultaLiquidacionAPIAlCerrarTurno(FechaHoraIniAPI, FechaHoraFinAPI,
+              T_TurcFecha.AsDateTime, T_TurcTurno.AsInteger, T_TurcEstacion.AsInteger);
           except
             on E: Exception do
               MensajeWarn('El turno se cerró, pero no fue posible consultar la liquidación en la API.' + #13 + E.Message);
