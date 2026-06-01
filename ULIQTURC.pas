@@ -236,8 +236,15 @@ type
     ModoProc:integer;
     primeraIsla:integer;
     orIsla:string;
+    FJsonLiquidacionAPI:string;
     procedure VerificarVales;
     function ValidaEstatusLiq:Boolean;
+    function ObtenerTokenLiquidacionAPI(var AAccessToken, ATokenType: string): Boolean;
+    function ConsultarLiquidacionAPI(const AAccessToken, ATokenType: string;
+      const AFechaIni, AFechaFin: TDateTime; const ANoTurno: Integer;
+      var AJsonLiquidacion: string): Boolean;
+    procedure ConsultaLiquidacionAPIAlCerrarTurno(const AFechaIni, AFechaFin: TDateTime;
+      const ANoTurno: Integer);
   public
     { Public declarations }
     procedure RefrescaTabla;
@@ -259,9 +266,433 @@ uses ULIBGRAL, DDMGEN, UGEN_NET,  ULIBDATABASE, DDMGAS, DDMGASQ,
   ULIQTURCcpol, ULIQTURCVP, UGASEXPO, UCNTPOLIN, ULIQTRAN2, ULIQRCUP2,
   ULIQTURCJT,UAutoriza, ULIQLIQGR, ULIQPVALR, ULIQRCUPR, ULIQRCUP2R,
   ULIQTRANR, ULIQPVALK, DDMAJUS, ULIQFDEP, DDMGENT, ULIQSALISLA, DDMXML,
-  UGENXMLMES, UAVANCE, fClientForm, UGASXMLMES, ULIQREP47, DDM_PUNTOS;
+  UGENXMLMES, UAVANCE, fClientForm, UGASXMLMES, ULIQREP47, DDM_PUNTOS,
+  ComObj, uLkJSON;
 
 {$R *.DFM}
+
+const
+  WINHTTP_OPTION_SECURE_PROTOCOLS = 9;
+  WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 = $00000800;
+  LIQ_API_IDP_BASE_URL = 'https://idpautenticacionestaciondev.azurewebsites.net';
+  LIQ_API_BASE_URL = 'https://estaciondev.igas.mx';
+  LIQ_API_USERNAME = 'PL_8169_EXP_ES_2015';
+  LIQ_API_PASSWORD = '3g.SiM8&Z^z9';
+
+function LiqApiRemoveTrailingSlash(const S: string): string;
+begin
+  Result := Trim(S);
+  while (Length(Result) > 0) and (Result[Length(Result)] = '/') do
+    Delete(Result, Length(Result), 1);
+end;
+
+function LiqApiUrlEncode(const S: string): string;
+var
+  I: Integer;
+  Ch: Char;
+begin
+  Result := '';
+  for I := 1 to Length(S) do begin
+    Ch := S[I];
+    if Ch in ['A'..'Z', 'a'..'z', '0'..'9', '-', '_', '.', '~'] then
+      Result := Result + Ch
+    else if Ch = ' ' then
+      Result := Result + '+'
+    else
+      Result := Result + '%' + IntToHex(Ord(Ch), 2);
+  end;
+end;
+
+function LiqApiExtractJsonStringValue(const Json, Key: string): string;
+var
+  P, I, StartPos: Integer;
+  Pattern: string;
+  Ch: Char;
+begin
+  Result := '';
+  Pattern := '"' + Key + '"';
+
+  P := Pos(Pattern, Json);
+  if P = 0 then
+    Exit;
+
+  I := P + Length(Pattern);
+
+  while (I <= Length(Json)) and (Json[I] <= ' ') do
+    Inc(I);
+
+  if (I > Length(Json)) or (Json[I] <> ':') then
+    Exit;
+
+  Inc(I);
+
+  while (I <= Length(Json)) and (Json[I] <= ' ') do
+    Inc(I);
+
+  if I > Length(Json) then
+    Exit;
+
+  if Json[I] = '"' then begin
+    Inc(I);
+    while I <= Length(Json) do begin
+      Ch := Json[I];
+      if Ch = '"' then
+        Break;
+
+      if Ch = '\' then begin
+        Inc(I);
+        if I > Length(Json) then
+          Break;
+
+        case Json[I] of
+          '"', '\', '/':
+            Result := Result + Json[I];
+          'b':
+            Result := Result + #8;
+          'f':
+            Result := Result + #12;
+          'n':
+            Result := Result + #10;
+          'r':
+            Result := Result + #13;
+          't':
+            Result := Result + #9;
+          'u':
+            Inc(I, 4);
+        else
+          Result := Result + Json[I];
+        end;
+      end
+      else
+        Result := Result + Ch;
+
+      Inc(I);
+    end;
+  end
+  else begin
+    StartPos := I;
+    while (I <= Length(Json)) and not (Json[I] in [',', '}', ']', #9, #10, #13, ' ']) do
+      Inc(I);
+    Result := Trim(Copy(Json, StartPos, I - StartPos));
+  end;
+end;
+
+procedure LiqApiHttpRequest(const Method, Url, Body, Authorization, ContentType: string;
+  var StatusCode: Integer; var ResponseText: string);
+var
+  Http: OleVariant;
+begin
+  StatusCode := 0;
+  ResponseText := '';
+
+  Http := CreateOleObject('WinHttp.WinHttpRequest.5.1');
+  Http.Open(Method, Url, False);
+
+  try
+    Http.SetTimeouts(15000, 15000, 30000, 60000);
+  except
+  end;
+
+  try
+    Http.Option[WINHTTP_OPTION_SECURE_PROTOCOLS] := WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+  except
+  end;
+
+  if ContentType <> '' then
+    Http.SetRequestHeader('Content-Type', ContentType);
+
+  if Authorization <> '' then
+    Http.SetRequestHeader('Authorization', Authorization);
+
+  Http.SetRequestHeader('Accept', 'application/json');
+
+  if Body <> '' then
+    Http.Send(Body)
+  else
+    Http.Send;
+
+  StatusCode := Http.Status;
+  ResponseText := Http.ResponseText;
+end;
+
+function LiqApiCombinaFechaHora(const AFecha, AHora: TDateTime): TDateTime;
+begin
+  if Trunc(AHora) = 0 then
+    Result := Trunc(AFecha) + Frac(AHora)
+  else
+    Result := AHora;
+end;
+
+function LiqApiFormatDateTimeParam(const AValue: TDateTime): string;
+begin
+  Result := FormatDateTime('yyyy-mm-dd hh:nn:ss', AValue);
+end;
+
+function TFLIQTURC.ObtenerTokenLiquidacionAPI(var AAccessToken, ATokenType: string): Boolean;
+var
+  Url: string;
+  Body: string;
+  Status: Integer;
+  Resp: string;
+  Token: string;
+begin
+  Result := False;
+  AAccessToken := '';
+  ATokenType := '';
+
+  Url := LiqApiRemoveTrailingSlash(LIQ_API_IDP_BASE_URL) + '/auth/token';
+  Body := 'username=' + LiqApiUrlEncode(LIQ_API_USERNAME) +
+          '&password=' + LiqApiUrlEncode(LIQ_API_PASSWORD) +
+          '&grant_type=password';
+
+  LiqApiHttpRequest(
+    'POST',
+    Url,
+    Body,
+    '',
+    'application/x-www-form-urlencoded',
+    Status,
+    Resp
+  );
+
+  if not (Status in [200, 201]) then
+    raise Exception.Create('La API no regreso exito al solicitar token. HTTP ' + IntToStr(Status) + #13 + Resp);
+
+  Token := LiqApiExtractJsonStringValue(Resp, 'access_token');
+  if Token = '' then
+    Token := LiqApiExtractJsonStringValue(Resp, 'token');
+  if Token = '' then
+    Token := LiqApiExtractJsonStringValue(Resp, 'id_token');
+
+  ATokenType := LiqApiExtractJsonStringValue(Resp, 'token_type');
+  if ATokenType = '' then
+    ATokenType := 'Bearer';
+
+  if Token = '' then
+    raise Exception.Create('No se encontro access_token/token/id_token en la respuesta del token.' + #13 + Resp);
+
+  AAccessToken := StringReplace(Token, 'Bearer ', '', [rfIgnoreCase]);
+  Result := True;
+end;
+
+function LiqApiStrToFloatDef(const S: string; const ADefault: Double): Double;
+var
+  Tmp: string;
+begin
+  Result := ADefault;
+  Tmp := Trim(S);
+  if Tmp = '' then
+    Exit;
+
+  try
+    Result := StrToFloat(Tmp);
+  except
+    try
+      Tmp := StringReplace(Tmp, '.', DecimalSeparator, [rfReplaceAll]);
+      Result := StrToFloat(Tmp);
+    except
+      Result := ADefault;
+    end;
+  end;
+end;
+
+function LiqApiJsonStringDef(AObj: TlkJSONobject; const AName, ADefault: string): string;
+var
+  JValue: TlkJSONbase;
+begin
+  Result := ADefault;
+  if not Assigned(AObj) then
+    Exit;
+
+  JValue := AObj.Field[AName];
+  if not Assigned(JValue) then
+    Exit;
+
+  if JValue is TlkJSONnull then
+    Exit;
+
+  try
+    Result := VarToStr(JValue.Value);
+  except
+    Result := ADefault;
+  end;
+end;
+
+function LiqApiJsonDoubleDef(AObj: TlkJSONobject; const AName: string; const ADefault: Double): Double;
+var
+  JValue: TlkJSONbase;
+begin
+  Result := ADefault;
+  if not Assigned(AObj) then
+    Exit;
+
+  JValue := AObj.Field[AName];
+  if not Assigned(JValue) then
+    Exit;
+
+  if JValue is TlkJSONnull then
+    Exit;
+
+  try
+    if JValue is TlkJSONstring then
+      Result := LiqApiStrToFloatDef(VarToStr(JValue.Value), ADefault)
+    else
+      Result := JValue.Value;
+  except
+    Result := ADefault;
+  end;
+end;
+
+function LiqApiJsonIntegerDef(AObj: TlkJSONobject; const AName: string; const ADefault: Integer): Integer;
+begin
+  Result := Trunc(LiqApiJsonDoubleDef(AObj, AName, ADefault));
+end;
+
+function LiqApiEsDetalleLiquidacion(AValue: TlkJSONbase): Boolean;
+begin
+  Result := Assigned(AValue) and (AValue is TlkJSONobject) and
+            (Assigned(TlkJSONobject(AValue).Field['id']) or
+             Assigned(TlkJSONobject(AValue).Field['detalleId']) or
+             Assigned(TlkJSONobject(AValue).Field['nombreCombustible']));
+end;
+
+function LiqApiContenedorDetalleLiquidacion(AValue: TlkJSONbase): TlkJSONbase;
+const
+  CAMPOS_CONTENEDOR: array[0..6] of string =
+    ('data', 'result', 'resultado', 'liquidacion', 'liquidaciones', 'detalle', 'detalles');
+var
+  I: Integer;
+  Campo: TlkJSONbase;
+begin
+  Result := AValue;
+
+  if LiqApiEsDetalleLiquidacion(Result) or (Assigned(Result) and (Result is TlkJSONlist)) then
+    Exit;
+
+  if Assigned(AValue) and (AValue is TlkJSONobject) then begin
+    for I := Low(CAMPOS_CONTENEDOR) to High(CAMPOS_CONTENEDOR) do begin
+      Campo := TlkJSONobject(AValue).Field[CAMPOS_CONTENEDOR[I]];
+      if Assigned(Campo) then begin
+        Result := Campo;
+        Exit;
+      end;
+    end;
+  end;
+end;
+
+function LiqApiCrearObjetoDetalleLiquidacion(AOrigen: TlkJSONobject): TlkJSONobject;
+begin
+  Result := TlkJSONobject.Generate;
+
+  // Mantener exactamente estos campos y este orden.
+  Result.Add('id', LiqApiJsonIntegerDef(AOrigen, 'id', 0));
+  Result.Add('noTurno', LiqApiJsonIntegerDef(AOrigen, 'noTurno', 0));
+  Result.Add('fechaTurno', LiqApiJsonStringDef(AOrigen, 'fechaTurno', ''));
+  Result.Add('detalleId', LiqApiJsonIntegerDef(AOrigen, 'detalleId', 0));
+  Result.Add('diferencia', LiqApiJsonDoubleDef(AOrigen, 'diferencia', 0));
+  Result.Add('devolucion', LiqApiJsonDoubleDef(AOrigen, 'devolucion', 0));
+  Result.Add('consignacion', LiqApiJsonDoubleDef(AOrigen, 'consignacion', 0));
+  Result.Add('diferenciaLecturas', LiqApiJsonDoubleDef(AOrigen, 'diferenciaLecturas', 0));
+  Result.Add('diferenciaLecturas2', LiqApiJsonDoubleDef(AOrigen, 'diferenciaLecturas2', 0));
+  Result.Add('noCombustible', LiqApiJsonIntegerDef(AOrigen, 'noCombustible', 0));
+  Result.Add('nombreCombustible', LiqApiJsonStringDef(AOrigen, 'nombreCombustible', ''));
+  Result.Add('precio', LiqApiJsonDoubleDef(AOrigen, 'precio', 0));
+  Result.Add('noManguera', LiqApiJsonIntegerDef(AOrigen, 'noManguera', 0));
+end;
+
+function LiqApiCrearJsonDetalleLiquidacion(const ARespuestaAPI: string): string;
+var
+  JsonRespuesta: TlkJSONbase;
+  JsonContenedor: TlkJSONbase;
+  JsonSalida: TlkJSONbase;
+  ListaSalida: TlkJSONlist;
+  I: Integer;
+begin
+  Result := '';
+  JsonRespuesta := nil;
+  JsonSalida := nil;
+
+  JsonRespuesta := TlkJSON.ParseText(ARespuestaAPI);
+  if not Assigned(JsonRespuesta) then
+    raise Exception.Create('La respuesta de la liquidacion no es un JSON valido.' + #13 + ARespuestaAPI);
+
+  try
+    JsonContenedor := LiqApiContenedorDetalleLiquidacion(JsonRespuesta);
+
+    if Assigned(JsonContenedor) and (JsonContenedor is TlkJSONlist) then begin
+      ListaSalida := TlkJSONlist.Generate;
+      JsonSalida := ListaSalida;
+
+      for I := 0 to JsonContenedor.Count - 1 do begin
+        if JsonContenedor.Child[I] is TlkJSONobject then
+          ListaSalida.Add(LiqApiCrearObjetoDetalleLiquidacion(TlkJSONobject(JsonContenedor.Child[I])));
+      end;
+    end
+    else if Assigned(JsonContenedor) and (JsonContenedor is TlkJSONobject) then
+      JsonSalida := LiqApiCrearObjetoDetalleLiquidacion(TlkJSONobject(JsonContenedor))
+    else
+      raise Exception.Create('La respuesta de la liquidacion no contiene un objeto de detalle valido.' + #13 + ARespuestaAPI);
+
+    Result := TlkJSON.GenerateText(JsonSalida);
+  finally
+    if Assigned(JsonSalida) then
+      JsonSalida.Free;
+    JsonRespuesta.Free;
+  end;
+end;
+
+function TFLIQTURC.ConsultarLiquidacionAPI(const AAccessToken, ATokenType: string;
+  const AFechaIni, AFechaFin: TDateTime; const ANoTurno: Integer;
+  var AJsonLiquidacion: string): Boolean;
+var
+  Url: string;
+  Status: Integer;
+  Resp: string;
+  AuthHeader: string;
+begin
+  Result := False;
+  AJsonLiquidacion := '';
+
+  Url := LiqApiRemoveTrailingSlash(LIQ_API_BASE_URL) +
+         '/api/legacy/liquidacion/getdetallecombustible' +
+         '?fechaini=' + LiqApiUrlEncode(LiqApiFormatDateTimeParam(AFechaIni)) +
+         '&fechafin=' + LiqApiUrlEncode(LiqApiFormatDateTimeParam(AFechaFin)) +
+         '&noTurno=' + LiqApiUrlEncode(IntToStr(ANoTurno));
+
+  AuthHeader := ATokenType + ' ' + AAccessToken;
+
+  LiqApiHttpRequest(
+    'GET',
+    Url,
+    '',
+    AuthHeader,
+    '',
+    Status,
+    Resp
+  );
+
+  if not (Status in [200, 201]) then
+    raise Exception.Create('La API no regreso exito al consultar liquidaciones. HTTP ' + IntToStr(Status) + #13 + Resp);
+
+  AJsonLiquidacion := LiqApiCrearJsonDetalleLiquidacion(Resp);
+  Result := True;
+end;
+
+procedure TFLIQTURC.ConsultaLiquidacionAPIAlCerrarTurno(const AFechaIni, AFechaFin: TDateTime;
+  const ANoTurno: Integer);
+var
+  AccessToken: string;
+  TokenType: string;
+  JsonLiquidacion: string;
+begin
+  if ObtenerTokenLiquidacionAPI(AccessToken, TokenType) then begin
+    ConsultarLiquidacionAPI(AccessToken, TokenType, AFechaIni, AFechaFin,
+      ANoTurno, JsonLiquidacion);
+
+    // Se conserva para devolverlo/enviarlo posteriormente sin cambiar su estructura.
+    FJsonLiquidacionAPI := JsonLiquidacion;
+  end;
+end;
 
 procedure TFLIQTURC.PreparaForma(xModo:integer);
 begin
@@ -1709,6 +2140,7 @@ var LClaseCred,
     i:word;
     bm:tBookMark;
     xturno : Integer;
+    FechaHoraIniAPI, FechaHoraFinAPI: TDateTime;
 begin
   with DMGEN,DMGAS,DMLIQ do begin
     if ModoProc=1 then
@@ -2014,6 +2446,17 @@ begin
           T_TurcEstatus.AsString:='C';
           T_TurcHoraFin.AsDateTime:=Date+Time;
           T_Turc.Post;
+
+          FechaHoraIniAPI := LiqApiCombinaFechaHora(T_TurcFecha.AsDateTime, T_TurcHoraIni.AsDateTime);
+          FechaHoraFinAPI := LiqApiCombinaFechaHora(T_TurcFecha.AsDateTime, T_TurcHoraFin.AsDateTime);
+
+          try
+            ConsultaLiquidacionAPIAlCerrarTurno(FechaHoraIniAPI, FechaHoraFinAPI, T_TurcTurno.AsInteger);
+          except
+            on E: Exception do
+              MensajeWarn('El turno se cerró, pero no fue posible consultar la liquidación en la API.' + #13 + E.Message);
+          end;
+
           if VarLiqTurnoRestringido then VarLiqTurnoRestringido:=false;
           RefrescaQuery(DMGASQ.QT_Turca);
         except
