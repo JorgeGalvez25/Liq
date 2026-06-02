@@ -389,34 +389,40 @@ begin
   StatusCode := 0;
   ResponseText := '';
 
-  Http := CreateOleObject('WinHttp.WinHttpRequest.5.1');
-  Http.Open(Method, Url, False);
-
   try
-    Http.SetTimeouts(15000, 15000, 30000, 60000);
+    Http := CreateOleObject('WinHttp.WinHttpRequest.5.1');
+    Http.Open(Method, Url, False);
+
+    try
+      Http.SetTimeouts(15000, 15000, 30000, 60000);
+    except
+    end;
+
+    try
+      Http.Option[WINHTTP_OPTION_SECURE_PROTOCOLS] := WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+    except
+    end;
+
+    if ContentType <> '' then
+      Http.SetRequestHeader('Content-Type', ContentType);
+
+    if Authorization <> '' then
+      Http.SetRequestHeader('Authorization', Authorization);
+
+    Http.SetRequestHeader('Accept', 'application/json');
+
+    if Body <> '' then
+      Http.Send(Body)
+    else
+      Http.Send;
+
+    StatusCode := Http.Status;
+    ResponseText := Http.ResponseText;
   except
+    on E: Exception do
+      raise Exception.Create('Error de comunicacion con la API. Metodo: ' + Method +
+        ', URL: ' + Url + #13 + E.Message);
   end;
-
-  try
-    Http.Option[WINHTTP_OPTION_SECURE_PROTOCOLS] := WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-  except
-  end;
-
-  if ContentType <> '' then
-    Http.SetRequestHeader('Content-Type', ContentType);
-
-  if Authorization <> '' then
-    Http.SetRequestHeader('Authorization', Authorization);
-
-  Http.SetRequestHeader('Accept', 'application/json');
-
-  if Body <> '' then
-    Http.Send(Body)
-  else
-    Http.Send;
-
-  StatusCode := Http.Status;
-  ResponseText := Http.ResponseText;
 end;
 
 function LiqApiCombinaFechaHora(const AFecha, AHora: TDateTime): TDateTime;
@@ -768,16 +774,74 @@ end;
 
 procedure TFLIQTURC.AplicarAjusteDGASAJUD2Json(var AJsonLiquidacion: string;
   const AEstacion: Integer; const AFechaTurno: TDateTime; const ANoTurno: Integer);
+type
+  TAjusteDGASAJUD2CacheItem = record
+    NoCombustible: Integer;
+    Inicializado: Boolean;
+    ManguerasTotales: Integer;
+    ManguerasProcesadas: Integer;
+    VolumenTotal: Double;
+    VolumenBase: Double;
+    VolumenAsignado: Double;
+  end;
 var
   JsonBase: TlkJSONbase;
   I: Integer;
   Obj: TlkJSONobject;
-  NoCombustible: Integer;
-  CantidadMangueras: Integer;
-  VolumenAjuste: Double;
-  VolumenPorManguera: Double;
+  CacheAjuste: array of TAjusteDGASAJUD2CacheItem;
+
+  function BuscaCacheAjuste(const ANoCombustible: Integer): Integer;
+  var
+    J: Integer;
+  begin
+    Result := -1;
+
+    if Length(CacheAjuste) = 0 then
+      Exit;
+
+    for J := Low(CacheAjuste) to High(CacheAjuste) do begin
+      if CacheAjuste[J].NoCombustible = ANoCombustible then begin
+        Result := J;
+        Exit;
+      end;
+    end;
+  end;
+
+  function AseguraCacheAjuste(const ANoCombustible: Integer): Integer;
+  begin
+    Result := BuscaCacheAjuste(ANoCombustible);
+
+    if Result < 0 then begin
+      Result := Length(CacheAjuste);
+      SetLength(CacheAjuste, Result + 1);
+      FillChar(CacheAjuste[Result], SizeOf(CacheAjuste[Result]), 0);
+      CacheAjuste[Result].NoCombustible := ANoCombustible;
+    end;
+  end;
+
+  procedure InicializaCacheAjuste(const ACacheIndex, ANoCombustible: Integer);
+  begin
+    if CacheAjuste[ACacheIndex].Inicializado then
+      Exit;
+
+    CacheAjuste[ACacheIndex].ManguerasTotales :=
+      LiqApiCuentaManguerasAjuste(JsonBase, AFechaTurno, ANoTurno, ANoCombustible);
+
+    if CacheAjuste[ACacheIndex].ManguerasTotales > 0 then begin
+      CacheAjuste[ACacheIndex].VolumenTotal :=
+        DameVolumenAjusteDGASAJUD2(AEstacion, AFechaTurno, ANoTurno, ANoCombustible);
+      CacheAjuste[ACacheIndex].VolumenBase :=
+        CacheAjuste[ACacheIndex].VolumenTotal / CacheAjuste[ACacheIndex].ManguerasTotales;
+    end;
+
+    CacheAjuste[ACacheIndex].Inicializado := True;
+  end;
 
   procedure AplicaObjeto(AObj: TlkJSONobject);
+  var
+    NoCombustible: Integer;
+    CacheIndex: Integer;
+    VolumenPorManguera: Double;
   begin
     if not Assigned(AObj) then
       Exit;
@@ -790,12 +854,26 @@ var
     if NoCombustible <= 0 then
       Exit;
 
-    CantidadMangueras := LiqApiCuentaManguerasAjuste(JsonBase, AFechaTurno, ANoTurno, NoCombustible);
-    if CantidadMangueras <= 0 then
+    CacheIndex := AseguraCacheAjuste(NoCombustible);
+    InicializaCacheAjuste(CacheIndex, NoCombustible);
+
+    if CacheAjuste[CacheIndex].ManguerasTotales <= 0 then
       Exit;
 
-    VolumenAjuste := DameVolumenAjusteDGASAJUD2(AEstacion, AFechaTurno, ANoTurno, NoCombustible);
-    VolumenPorManguera := VolumenAjuste / CantidadMangueras;
+    Inc(CacheAjuste[CacheIndex].ManguerasProcesadas);
+
+    if CacheAjuste[CacheIndex].ManguerasProcesadas >= CacheAjuste[CacheIndex].ManguerasTotales then begin
+      // A la ultima manguera del grupo se le asigna el saldo residual.
+      VolumenPorManguera :=
+        CacheAjuste[CacheIndex].VolumenTotal - CacheAjuste[CacheIndex].VolumenAsignado;
+    end
+    else begin
+      // Las mangueras anteriores reciben la parte equitativa base.
+      VolumenPorManguera := CacheAjuste[CacheIndex].VolumenBase;
+    end;
+
+    CacheAjuste[CacheIndex].VolumenAsignado :=
+      CacheAjuste[CacheIndex].VolumenAsignado + VolumenPorManguera;
 
     LiqApiAsignaDiferenciaLecturas2(AObj, VolumenPorManguera);
   end;
@@ -833,6 +911,10 @@ var
   TokenType: string;
   JsonLiquidacion: string;
 begin
+  // Limpia el JSON anterior antes de intentar consultar la nueva liquidacion.
+  // Si la API falla, no debe quedar en memoria informacion de otro turno.
+  FJsonLiquidacionAPI := '';
+
   if ObtenerTokenLiquidacionAPI(AccessToken, TokenType) then begin
     ConsultarLiquidacionAPI(AccessToken, TokenType, AFechaIni, AFechaFin,
       ANoTurno, JsonLiquidacion);
