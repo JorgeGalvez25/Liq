@@ -447,7 +447,7 @@ end;
 
 function LiqApiFormatDateTimeParam(const AValue: TDateTime): string;
 begin
-  Result := FormatDateTime('yyyy-mm-dd hh:nn:ss', AValue);
+  Result := FormatDateTime('yyyy-mm-dd', AValue);
 end;
 
 function LiqApiObtenerToken(var AAccessToken, ATokenType: string): Boolean;
@@ -578,7 +578,7 @@ begin
 
   // El peso representa el movimiento de la manguera. Se usa valor absoluto para
   // que una lectura negativa no reste peso al grupo.
-  Result := Abs(LiqApiJsonDoubleDef(AObj, 'diferenciaLecturas', 0));
+  Result := Abs(LiqApiJsonDoubleDef(AObj, 'diferencia', 0));
 end;
 
 function LiqApiModoRepartoAjuste: TModoRepartoAjuste;
@@ -588,7 +588,7 @@ begin
   // Por compatibilidad con la regla pedida originalmente, el valor por defecto
   // sigue siendo partes iguales. Si se requiere ponderacion, configurar:
   // LiqRepartoAjuste = Proporcional
-  Result := mraPartesIguales;
+  Result := mraProporcional;
 
   try
     Modo := Trim(DMGEN.VarComp('LiqRepartoAjuste'));
@@ -597,7 +597,7 @@ begin
     else if SameText(Modo, 'Iguales') then
       Result := mraPartesIguales;
   except
-    Result := mraPartesIguales;
+    Result := mraProporcional;
   end;
 end;
 
