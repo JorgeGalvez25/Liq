@@ -445,8 +445,10 @@ begin
     Result := AHora;
 end;
 
-function LiqApiFormatDateTimeParam(const AValue: TDateTime): string;
+function LiqApiFormatDateParam(const AValue: TDateTime): string;
 begin
+  // La API de liquidaciones espera la fecha del turno sin hora.
+  // El filtro fino del turno se completa con noTurno.
   Result := FormatDateTime('yyyy-mm-dd', AValue);
 end;
 
@@ -576,8 +578,9 @@ begin
   if not Assigned(AObj) then
     Exit;
 
-  // El peso representa el movimiento de la manguera. Se usa valor absoluto para
-  // que una lectura negativa no reste peso al grupo.
+  // El peso representa lo vendido/movido por la manguera segun la liquidacion
+  // recibida de la API. Se usa valor absoluto para que un signo negativo no
+  // reste peso al grupo ni rompa el reparto proporcional.
   Result := Abs(LiqApiJsonDoubleDef(AObj, 'diferencia', 0));
 end;
 
@@ -585,17 +588,17 @@ function LiqApiModoRepartoAjuste: TModoRepartoAjuste;
 var
   Modo: string;
 begin
-  // Por compatibilidad con la regla pedida originalmente, el valor por defecto
-  // sigue siendo partes iguales. Si se requiere ponderacion, configurar:
-  // LiqRepartoAjuste = Proporcional
+  // Por defecto el ajuste se reparte proporcionalmente al movimiento de cada
+  // manguera. Si se requiere repartir en partes iguales, configurar:
+  // LiqRepartoAjuste = Iguales
   Result := mraProporcional;
 
   try
     Modo := Trim(DMGEN.VarComp('LiqRepartoAjuste'));
-    if SameText(Modo, 'Proporcional') then
-      Result := mraProporcional
-    else if SameText(Modo, 'Iguales') then
-      Result := mraPartesIguales;
+    if SameText(Modo, 'Iguales') then
+      Result := mraPartesIguales
+    else if SameText(Modo, 'Proporcional') then
+      Result := mraProporcional;
   except
     Result := mraProporcional;
   end;
@@ -792,8 +795,8 @@ begin
 
   Url := LiqApiRemoveTrailingSlash(LIQ_API_BASE_URL) +
          '/api/legacy/liquidacion/getdetallecombustible' +
-         '?fechaini=' + LiqApiUrlEncode(LiqApiFormatDateTimeParam(AFechaIni)) +
-         '&fechafin=' + LiqApiUrlEncode(LiqApiFormatDateTimeParam(AFechaFin)) +
+         '?fechaini=' + LiqApiUrlEncode(LiqApiFormatDateParam(AFechaIni)) +
+         '&fechafin=' + LiqApiUrlEncode(LiqApiFormatDateParam(AFechaFin)) +
          '&noTurno=' + LiqApiUrlEncode(IntToStr(ANoTurno));
 
   AuthHeader := ATokenType + ' ' + AAccessToken;
@@ -821,7 +824,7 @@ function TFLIQTURC.DameVolumenAjusteDGASAJUD2(const AEstacion: Integer;
 begin
   Result := 0;
 
-  with DMGEN do begin
+  with DMGAS do begin
     Q_Auxi.Close;
     Q_Auxi.SQL.Clear;
     Q_AuxiReal1.FieldKind := fkInternalCalc;
@@ -1123,6 +1126,8 @@ begin
 end;
 
 procedure TLiqApiConsultaLiqThread.EntregaResultado;
+var
+  jsonStr:TStringList;
 begin
   // ---------- ESTO YA CORRE EN EL HILO PRINCIPAL ----------
   if FFormulario = nil then
@@ -1135,6 +1140,10 @@ begin
     // El ajuste por manguera lee DGASAJUD2: correcto ejecutarlo aqui.
     FFormulario.AplicarAjusteDGASAJUD2Json(FJson, FEstacion, FFechaTurno, FNoTurno);
     FFormulario.FJsonLiquidacionAPI := FJson;
+
+    jsonStr:=TStringList.Create();
+    jsonStr.Add(FJson);
+    jsonStr.SaveToFile('C:\ImagenCo\JsonLiq.txt');
 
     // Aqui puede agregarse la persistencia/envio posterior del JSON ajustado,
     // usando FEstacion, FFechaTurno, FNoTurno y FJson.
