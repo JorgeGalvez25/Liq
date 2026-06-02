@@ -237,13 +237,12 @@ type
     primeraIsla:integer;
     orIsla:string;
     FJsonLiquidacionAPI:string;
+    FHiloConsultaLiq: TThread;   // consulta de liquidacion en segundo plano
     procedure VerificarVales;
     function ValidaEstatusLiq:Boolean;
-    function ObtenerTokenLiquidacionAPI(var AAccessToken, ATokenType: string): Boolean;
-    function ConsultarLiquidacionAPI(const AAccessToken, ATokenType: string;
-      const AFechaIni, AFechaFin: TDateTime; const ANoTurno: Integer;
-      var AJsonLiquidacion: string): Boolean;
     function DameVolumenAjusteDGASAJUD2(const AEstacion: Integer;
+      const AFechaTurno: TDateTime; const ANoTurno, ANoCombustible: Integer): Double;
+    function DameMagnitudARepartirDGASAJUD2(const AEstacion: Integer;
       const AFechaTurno: TDateTime; const ANoTurno, ANoCombustible: Integer): Double;
     procedure AplicarAjusteDGASAJUD2Json(var AJsonLiquidacion: string;
       const AEstacion: Integer; const AFechaTurno: TDateTime; const ANoTurno: Integer);
@@ -271,7 +270,7 @@ uses ULIBGRAL, DDMGEN, UGEN_NET,  ULIBDATABASE, DDMGAS, DDMGASQ,
   ULIQTURCJT,UAutoriza, ULIQLIQGR, ULIQPVALR, ULIQRCUPR, ULIQRCUP2R,
   ULIQTRANR, ULIQPVALK, DDMAJUS, ULIQFDEP, DDMGENT, ULIQSALISLA, DDMXML,
   UGENXMLMES, UAVANCE, fClientForm, UGASXMLMES, ULIQREP47, DDM_PUNTOS,
-  ComObj, uLkJSON;
+  ComObj, uLkJSON, ActiveX;
 
 {$R *.DFM}
 
@@ -282,6 +281,15 @@ const
   LIQ_API_BASE_URL = 'https://estaciondev.igas.mx';
   LIQ_API_USERNAME = 'PL_8169_EXP_ES_2015';
   LIQ_API_PASSWORD = '3g.SiM8&Z^z9';
+  // Timeouts en milisegundos: resolve, connect, send, receive.
+  // Se mantienen cortos para no congelar demasiado la UI durante el cierre.
+  LIQ_API_TIMEOUT_RESOLVE = 5000;
+  LIQ_API_TIMEOUT_CONNECT = 5000;
+  LIQ_API_TIMEOUT_SEND    = 10000;
+  LIQ_API_TIMEOUT_RECEIVE = 15000;
+
+type
+  TModoRepartoAjuste = (mraPartesIguales, mraProporcional);
 
 function LiqApiRemoveTrailingSlash(const S: string): string;
 begin
@@ -394,7 +402,11 @@ begin
     Http.Open(Method, Url, False);
 
     try
-      Http.SetTimeouts(15000, 15000, 30000, 60000);
+      Http.SetTimeouts(
+        LIQ_API_TIMEOUT_RESOLVE,
+        LIQ_API_TIMEOUT_CONNECT,
+        LIQ_API_TIMEOUT_SEND,
+        LIQ_API_TIMEOUT_RECEIVE);
     except
     end;
 
@@ -438,7 +450,7 @@ begin
   Result := FormatDateTime('yyyy-mm-dd hh:nn:ss', AValue);
 end;
 
-function TFLIQTURC.ObtenerTokenLiquidacionAPI(var AAccessToken, ATokenType: string): Boolean;
+function LiqApiObtenerToken(var AAccessToken, ATokenType: string): Boolean;
 var
   Url: string;
   Body: string;
@@ -556,6 +568,65 @@ end;
 function LiqApiJsonIntegerDef(AObj: TlkJSONobject; const AName: string; const ADefault: Integer): Integer;
 begin
   Result := Trunc(LiqApiJsonDoubleDef(AObj, AName, ADefault));
+end;
+
+function LiqApiPesoManguera(AObj: TlkJSONobject): Double;
+begin
+  Result := 0;
+  if not Assigned(AObj) then
+    Exit;
+
+  // El peso representa el movimiento de la manguera. Se usa valor absoluto para
+  // que una lectura negativa no reste peso al grupo.
+  Result := Abs(LiqApiJsonDoubleDef(AObj, 'diferenciaLecturas', 0));
+end;
+
+function LiqApiModoRepartoAjuste: TModoRepartoAjuste;
+var
+  Modo: string;
+begin
+  // Por compatibilidad con la regla pedida originalmente, el valor por defecto
+  // sigue siendo partes iguales. Si se requiere ponderacion, configurar:
+  // LiqRepartoAjuste = Proporcional
+  Result := mraPartesIguales;
+
+  try
+    Modo := Trim(DMGEN.VarComp('LiqRepartoAjuste'));
+    if SameText(Modo, 'Proporcional') then
+      Result := mraProporcional
+    else if SameText(Modo, 'Iguales') then
+      Result := mraPartesIguales;
+  except
+    Result := mraPartesIguales;
+  end;
+end;
+
+procedure LiqApiValidaMagnitudVsApi(const AVolumenTotal, ASumaDiferenciaApi: Double;
+  const ANoCombustible: Integer);
+const
+  UMBRAL_RELATIVO = 0.05;
+var
+  Denom: Double;
+begin
+  Denom := Abs(ASumaDiferenciaApi);
+  if Denom < 0.0001 then
+    Exit;
+
+  if Abs(Abs(AVolumenTotal) - Denom) / Denom > UMBRAL_RELATIVO then
+    MensajeWarn('Aviso liquidacion combustible ' + IntToStr(ANoCombustible) +
+      ': la magnitud a repartir (' + FloatToStr(AVolumenTotal) + ') difiere ' +
+      'mucho de la diferencia reportada por la API (' + FloatToStr(ASumaDiferenciaApi) +
+      '). Revisar si se esta repartiendo volumen neto en vez del delta de ajuste.');
+end;
+
+function LiqApiValidacionMagnitudActiva: Boolean;
+begin
+  Result := False;
+  try
+    Result := SameText(Trim(DMGEN.VarComp('LiqValidaMagnitudAjusteAPI')), 'Si');
+  except
+    Result := False;
+  end;
 end;
 
 function LiqApiEsDetalleLiquidacion(AValue: TlkJSONbase): Boolean;
@@ -707,7 +778,7 @@ begin
     AObj.Add('diferenciaLecturas2', AValor);
 end;
 
-function TFLIQTURC.ConsultarLiquidacionAPI(const AAccessToken, ATokenType: string;
+function LiqApiConsultarLiquidacion(const AAccessToken, ATokenType: string;
   const AFechaIni, AFechaFin: TDateTime; const ANoTurno: Integer;
   var AJsonLiquidacion: string): Boolean;
 var
@@ -772,76 +843,63 @@ begin
   end;
 end;
 
+function TFLIQTURC.DameMagnitudARepartirDGASAJUD2(const AEstacion: Integer;
+  const AFechaTurno: TDateTime; const ANoTurno, ANoCombustible: Integer): Double;
+begin
+  // Devuelve la magnitud que se reparte en diferenciaLecturas2.
+  // IMPORTANTE: hoy DGASAJUD2.volumen contiene el valor neto guardado por el
+  // cierre local. Si el contrato de la API pide otro delta, debe cambiarse aqui
+  // la fuente del dato, no el algoritmo de reparto.
+  Result := DameVolumenAjusteDGASAJUD2(AEstacion, AFechaTurno, ANoTurno, ANoCombustible);
+end;
+
 procedure TFLIQTURC.AplicarAjusteDGASAJUD2Json(var AJsonLiquidacion: string;
   const AEstacion: Integer; const AFechaTurno: TDateTime; const ANoTurno: Integer);
 type
-  TAjusteDGASAJUD2CacheItem = record
+  TMangueraAjuste = record
+    Obj: TlkJSONobject;
+    NoManguera: Integer;
+    Peso: Double;
+    DiferenciaApi: Double;
+  end;
+
+  TGrupoCombustibleAjuste = record
     NoCombustible: Integer;
-    Inicializado: Boolean;
-    ManguerasTotales: Integer;
-    ManguerasProcesadas: Integer;
+    Mangueras: array of TMangueraAjuste;
     VolumenTotal: Double;
-    VolumenBase: Double;
-    VolumenAsignado: Double;
+    SumaPesos: Double;
+    SumaDiferenciaApi: Double;
   end;
 var
   JsonBase: TlkJSONbase;
-  I: Integer;
-  Obj: TlkJSONobject;
-  CacheAjuste: array of TAjusteDGASAJUD2CacheItem;
+  Grupos: array of TGrupoCombustibleAjuste;
+  Modo: TModoRepartoAjuste;
 
-  function BuscaCacheAjuste(const ANoCombustible: Integer): Integer;
+  function IndiceGrupo(const ANoCombustible: Integer): Integer;
   var
     J: Integer;
   begin
-    Result := -1;
-
-    if Length(CacheAjuste) = 0 then
-      Exit;
-
-    for J := Low(CacheAjuste) to High(CacheAjuste) do begin
-      if CacheAjuste[J].NoCombustible = ANoCombustible then begin
+    for J := Low(Grupos) to High(Grupos) do begin
+      if Grupos[J].NoCombustible = ANoCombustible then begin
         Result := J;
         Exit;
       end;
     end;
+
+    Result := Length(Grupos);
+    SetLength(Grupos, Result + 1);
+    Grupos[Result].NoCombustible := ANoCombustible;
+    Grupos[Result].VolumenTotal := 0;
+    Grupos[Result].SumaPesos := 0;
+    Grupos[Result].SumaDiferenciaApi := 0;
+    SetLength(Grupos[Result].Mangueras, 0);
   end;
 
-  function AseguraCacheAjuste(const ANoCombustible: Integer): Integer;
-  begin
-    Result := BuscaCacheAjuste(ANoCombustible);
-
-    if Result < 0 then begin
-      Result := Length(CacheAjuste);
-      SetLength(CacheAjuste, Result + 1);
-      FillChar(CacheAjuste[Result], SizeOf(CacheAjuste[Result]), 0);
-      CacheAjuste[Result].NoCombustible := ANoCombustible;
-    end;
-  end;
-
-  procedure InicializaCacheAjuste(const ACacheIndex, ANoCombustible: Integer);
-  begin
-    if CacheAjuste[ACacheIndex].Inicializado then
-      Exit;
-
-    CacheAjuste[ACacheIndex].ManguerasTotales :=
-      LiqApiCuentaManguerasAjuste(JsonBase, AFechaTurno, ANoTurno, ANoCombustible);
-
-    if CacheAjuste[ACacheIndex].ManguerasTotales > 0 then begin
-      CacheAjuste[ACacheIndex].VolumenTotal :=
-        DameVolumenAjusteDGASAJUD2(AEstacion, AFechaTurno, ANoTurno, ANoCombustible);
-      CacheAjuste[ACacheIndex].VolumenBase :=
-        CacheAjuste[ACacheIndex].VolumenTotal / CacheAjuste[ACacheIndex].ManguerasTotales;
-    end;
-
-    CacheAjuste[ACacheIndex].Inicializado := True;
-  end;
-
-  procedure AplicaObjeto(AObj: TlkJSONobject);
+  procedure RecolectaManguera(AObj: TlkJSONobject);
   var
     NoCombustible: Integer;
-    CacheIndex: Integer;
-    VolumenPorManguera: Double;
+    GrupoIndex: Integer;
+    MangueraIndex: Integer;
   begin
     if not Assigned(AObj) then
       Exit;
@@ -854,49 +912,130 @@ var
     if NoCombustible <= 0 then
       Exit;
 
-    CacheIndex := AseguraCacheAjuste(NoCombustible);
-    InicializaCacheAjuste(CacheIndex, NoCombustible);
+    GrupoIndex := IndiceGrupo(NoCombustible);
+    MangueraIndex := Length(Grupos[GrupoIndex].Mangueras);
+    SetLength(Grupos[GrupoIndex].Mangueras, MangueraIndex + 1);
 
-    if CacheAjuste[CacheIndex].ManguerasTotales <= 0 then
-      Exit;
-
-    Inc(CacheAjuste[CacheIndex].ManguerasProcesadas);
-
-    if CacheAjuste[CacheIndex].ManguerasProcesadas >= CacheAjuste[CacheIndex].ManguerasTotales then begin
-      // A la ultima manguera del grupo se le asigna el saldo residual.
-      VolumenPorManguera :=
-        CacheAjuste[CacheIndex].VolumenTotal - CacheAjuste[CacheIndex].VolumenAsignado;
-    end
-    else begin
-      // Las mangueras anteriores reciben la parte equitativa base.
-      VolumenPorManguera := CacheAjuste[CacheIndex].VolumenBase;
-    end;
-
-    CacheAjuste[CacheIndex].VolumenAsignado :=
-      CacheAjuste[CacheIndex].VolumenAsignado + VolumenPorManguera;
-
-    LiqApiAsignaDiferenciaLecturas2(AObj, VolumenPorManguera);
+    Grupos[GrupoIndex].Mangueras[MangueraIndex].Obj := AObj;
+    Grupos[GrupoIndex].Mangueras[MangueraIndex].NoManguera :=
+      LiqApiJsonIntegerDef(AObj, 'noManguera', 0);
+    Grupos[GrupoIndex].Mangueras[MangueraIndex].Peso := LiqApiPesoManguera(AObj);
+    Grupos[GrupoIndex].Mangueras[MangueraIndex].DiferenciaApi :=
+      LiqApiJsonDoubleDef(AObj, 'diferencia', 0);
   end;
 
+  procedure OrdenaManguerasPorNumero(var AGrupo: TGrupoCombustibleAjuste);
+  var
+    I, J: Integer;
+    Tmp: TMangueraAjuste;
+  begin
+    for I := 1 to High(AGrupo.Mangueras) do begin
+      Tmp := AGrupo.Mangueras[I];
+      J := I - 1;
+      while (J >= 0) and (AGrupo.Mangueras[J].NoManguera > Tmp.NoManguera) do begin
+        AGrupo.Mangueras[J + 1] := AGrupo.Mangueras[J];
+        Dec(J);
+      end;
+      AGrupo.Mangueras[J + 1] := Tmp;
+    end;
+  end;
+
+  function IndiceMangueraResidual(const AGrupo: TGrupoCombustibleAjuste): Integer;
+  var
+    I: Integer;
+  begin
+    Result := 0;
+    for I := 1 to High(AGrupo.Mangueras) do begin
+      if (AGrupo.Mangueras[I].Peso > AGrupo.Mangueras[Result].Peso) or
+         ((AGrupo.Mangueras[I].Peso = AGrupo.Mangueras[Result].Peso) and
+          (AGrupo.Mangueras[I].NoManguera > AGrupo.Mangueras[Result].NoManguera)) then
+        Result := I;
+    end;
+  end;
+
+  procedure ReparteGrupo(var AGrupo: TGrupoCombustibleAjuste);
+  var
+    I: Integer;
+    N: Integer;
+    IndiceResidual: Integer;
+    VolumenAsignado: Double;
+    VolumenManguera: Double;
+    Fraccion: Double;
+    UsaProporcional: Boolean;
+  begin
+    N := Length(AGrupo.Mangueras);
+    if N <= 0 then
+      Exit;
+
+    OrdenaManguerasPorNumero(AGrupo);
+
+    AGrupo.VolumenTotal := DameMagnitudARepartirDGASAJUD2(
+      AEstacion, AFechaTurno, ANoTurno, AGrupo.NoCombustible);
+
+    AGrupo.SumaPesos := 0;
+    AGrupo.SumaDiferenciaApi := 0;
+    for I := 0 to N - 1 do begin
+      AGrupo.SumaPesos := AGrupo.SumaPesos + AGrupo.Mangueras[I].Peso;
+      AGrupo.SumaDiferenciaApi := AGrupo.SumaDiferenciaApi + AGrupo.Mangueras[I].DiferenciaApi;
+    end;
+
+    if LiqApiValidacionMagnitudActiva then
+      LiqApiValidaMagnitudVsApi(AGrupo.VolumenTotal, AGrupo.SumaDiferenciaApi,
+        AGrupo.NoCombustible);
+
+    UsaProporcional := (Modo = mraProporcional) and (Abs(AGrupo.SumaPesos) > 0.0000001);
+    IndiceResidual := IndiceMangueraResidual(AGrupo);
+    VolumenAsignado := 0;
+
+    for I := 0 to N - 1 do begin
+      if I = IndiceResidual then
+        Continue;
+
+      if UsaProporcional then
+        Fraccion := AGrupo.Mangueras[I].Peso / AGrupo.SumaPesos
+      else
+        Fraccion := 1 / N;
+
+      VolumenManguera := AGrupo.VolumenTotal * Fraccion;
+      VolumenAsignado := VolumenAsignado + VolumenManguera;
+      LiqApiAsignaDiferenciaLecturas2(AGrupo.Mangueras[I].Obj, VolumenManguera);
+    end;
+
+    // La manguera residual recibe el saldo exacto. Asi la suma por combustible
+    // siempre cuadra con DGASAJUD2, aunque existan decimales periodicos.
+    LiqApiAsignaDiferenciaLecturas2(AGrupo.Mangueras[IndiceResidual].Obj,
+      AGrupo.VolumenTotal - VolumenAsignado);
+  end;
+
+var
+  I: Integer;
+  GrupoIndex: Integer;
 begin
   if Trim(AJsonLiquidacion) = '' then
     Exit;
+
+  Modo := LiqApiModoRepartoAjuste;
 
   JsonBase := TlkJSON.ParseText(AJsonLiquidacion);
   if not Assigned(JsonBase) then
     raise Exception.Create('No fue posible parsear el JSON de liquidacion para aplicar DGASAJUD2.');
 
   try
+    SetLength(Grupos, 0);
+
+    // Pre-pasada: se agrupa por combustible. Esto evita consultas repetidas y
+    // hace posible un reparto determinista, sin depender del orden de la API.
     if JsonBase is TlkJSONlist then begin
       for I := 0 to JsonBase.Count - 1 do begin
-        if JsonBase.Child[I] is TlkJSONobject then begin
-          Obj := TlkJSONobject(JsonBase.Child[I]);
-          AplicaObjeto(Obj);
-        end;
+        if JsonBase.Child[I] is TlkJSONobject then
+          RecolectaManguera(TlkJSONobject(JsonBase.Child[I]));
       end;
     end
     else if JsonBase is TlkJSONobject then
-      AplicaObjeto(TlkJSONobject(JsonBase));
+      RecolectaManguera(TlkJSONobject(JsonBase));
+
+    for GrupoIndex := Low(Grupos) to High(Grupos) do
+      ReparteGrupo(Grupos[GrupoIndex]);
 
     AJsonLiquidacion := TlkJSON.GenerateText(JsonBase);
   finally
@@ -904,25 +1043,141 @@ begin
   end;
 end;
 
-procedure TFLIQTURC.ConsultaLiquidacionAPIAlCerrarTurno(const AFechaIni, AFechaFin, AFechaTurno: TDateTime;
+
+// ===========================================================================
+//  Consulta de liquidacion en segundo plano.
+//  - El HTTP corre en este hilo (token + consulta).
+//  - El ajuste por manguera lee DGASAJUD2, por eso se ejecuta despues en el
+//    hilo principal dentro de EntregaResultado (via Synchronize).
+// ===========================================================================
+type
+  TLiqApiConsultaLiqThread = class(TThread)
+  private
+    FFormulario: TFLIQTURC;        // se toca solo desde el hilo principal; nil = desvinculado
+    FFechaIni: TDateTime;
+    FFechaFin: TDateTime;
+    FFechaTurno: TDateTime;
+    FNoTurno: Integer;
+    FEstacion: Integer;
+    FJson: string;
+    FError: string;
+    procedure EntregaResultado;    // corre en el hilo principal (Synchronize)
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AFormulario: TFLIQTURC;
+      const AFechaIni, AFechaFin, AFechaTurno: TDateTime;
+      const ANoTurno, AEstacion: Integer);
+    procedure OlvidaFormulario;
+  end;
+
+constructor TLiqApiConsultaLiqThread.Create(AFormulario: TFLIQTURC;
+  const AFechaIni, AFechaFin, AFechaTurno: TDateTime;
   const ANoTurno, AEstacion: Integer);
+begin
+  inherited Create(True);          // suspendido: primero llenamos los campos
+  FreeOnTerminate := True;
+  FFormulario := AFormulario;
+  FFechaIni   := AFechaIni;
+  FFechaFin   := AFechaFin;
+  FFechaTurno := AFechaTurno;
+  FNoTurno    := ANoTurno;
+  FEstacion   := AEstacion;
+end;
+
+procedure TLiqApiConsultaLiqThread.OlvidaFormulario;
+begin
+  // Se invoca desde el hilo principal. A partir de aqui este hilo ya no debe
+  // tocar el formulario, aunque termine correctamente la consulta HTTP.
+  FFormulario := nil;
+end;
+
+procedure TLiqApiConsultaLiqThread.Execute;
 var
   AccessToken: string;
   TokenType: string;
-  JsonLiquidacion: string;
+  hr: HRESULT;
 begin
-  // Limpia el JSON anterior antes de intentar consultar la nueva liquidacion.
-  // Si la API falla, no debe quedar en memoria informacion de otro turno.
+  // WinHttp se crea con CreateOleObject (COM): este hilo debe inicializar COM.
+  hr := CoInitialize(nil);
+  try
+    try
+      if LiqApiObtenerToken(AccessToken, TokenType) then
+        LiqApiConsultarLiquidacion(AccessToken, TokenType,
+          FFechaIni, FFechaFin, FNoTurno, FJson)
+      else
+        FError := 'No fue posible obtener el token de la API.';
+    except
+      on E: Exception do
+        FError := E.Message;
+    end;
+  finally
+    if (hr = S_OK) or (hr = S_FALSE) then
+      CoUninitialize;
+  end;
+
+  // Regresa al hilo principal. El ajuste toca BD/VCL indirectamente, por eso
+  // no se ejecuta dentro del hilo de trabajo.
+  if not Terminated then
+    Synchronize(EntregaResultado);
+end;
+
+procedure TLiqApiConsultaLiqThread.EntregaResultado;
+begin
+  // ---------- ESTO YA CORRE EN EL HILO PRINCIPAL ----------
+  if FFormulario = nil then
+    Exit;
+
+  try
+    if FError <> '' then
+      raise Exception.Create(FError);
+
+    // El ajuste por manguera lee DGASAJUD2: correcto ejecutarlo aqui.
+    FFormulario.AplicarAjusteDGASAJUD2Json(FJson, FEstacion, FFechaTurno, FNoTurno);
+    FFormulario.FJsonLiquidacionAPI := FJson;
+
+    // Aqui puede agregarse la persistencia/envio posterior del JSON ajustado,
+    // usando FEstacion, FFechaTurno, FNoTurno y FJson.
+  except
+    on E: Exception do
+      MensajeWarn('El turno se cerro, pero no fue posible aplicar/consultar la '
+        + 'liquidacion en la API.' + #13 + E.Message);
+  end;
+
+  // El formulario ya no debe apuntar a este hilo cuando el hilo termine y se libere.
+  if FFormulario.FHiloConsultaLiq = Self then
+    FFormulario.FHiloConsultaLiq := nil;
+end;
+
+procedure TFLIQTURC.ConsultaLiquidacionAPIAlCerrarTurno(const AFechaIni, AFechaFin, AFechaTurno: TDateTime;
+  const ANoTurno, AEstacion: Integer);
+var
+  Hilo: TLiqApiConsultaLiqThread;
+begin
+  // Limpia el JSON anterior: si la consulta falla, no debe quedar en memoria
+  // informacion de otro turno.
   FJsonLiquidacionAPI := '';
 
-  if ObtenerTokenLiquidacionAPI(AccessToken, TokenType) then begin
-    ConsultarLiquidacionAPI(AccessToken, TokenType, AFechaIni, AFechaFin,
-      ANoTurno, JsonLiquidacion);
+  // Si quedo un hilo de un turno previo en vuelo, lo desvinculamos para que su
+  // resultado no escriba sobre el formulario fuera de contexto.
+  if Assigned(FHiloConsultaLiq) then begin
+    TLiqApiConsultaLiqThread(FHiloConsultaLiq).OlvidaFormulario;
+    FHiloConsultaLiq := nil;
+  end;
 
-    AplicarAjusteDGASAJUD2Json(JsonLiquidacion, AEstacion, AFechaTurno, ANoTurno);
+  // El HTTP (token + consulta) corre en segundo plano para no congelar la UI.
+  // El ajuste por manguera, que toca BD, se ejecuta despues en el hilo principal.
+  Hilo := TLiqApiConsultaLiqThread.Create(
+    Self, AFechaIni, AFechaFin, AFechaTurno, ANoTurno, AEstacion);
+  FHiloConsultaLiq := Hilo;
 
-    // Se conserva para devolverlo/enviarlo posteriormente sin cambiar su estructura.
-    FJsonLiquidacionAPI := JsonLiquidacion;
+  try
+    // Delphi clasico: Resume. En Delphi 2010+ se usaria Start.
+    Hilo.Resume;
+  except
+    FHiloConsultaLiq := nil;
+    Hilo.Free;
+    raise;
   end;
 end;
 
@@ -1035,6 +1290,14 @@ end;
 
 procedure TFLIQTURC.FormClose(Sender: TObject; var Action: TCloseAction);
 begin
+  // Si hay una consulta de liquidacion en segundo plano, la desvinculamos para
+  // que no intente tocar este formulario despues de cerrarse. El hilo terminara
+  // solo (FreeOnTerminate).
+  if Assigned(FHiloConsultaLiq) then begin
+    TLiqApiConsultaLiqThread(FHiloConsultaLiq).OlvidaFormulario;
+    FHiloConsultaLiq := nil;
+  end;
+
   QL_Turc.Close;
 end;
 
