@@ -237,7 +237,12 @@ type
     primeraIsla:integer;
     orIsla:string;
     FJsonLiquidacionAPI:string;
-    FHiloConsultaLiq: TThread;   // consulta de liquidacion en segundo plano
+    FHiloConsultaLiq: TThread;   // hilo activo de consulta de liquidacion
+    FColaConsultaLiq: TList;     // turnos pendientes por consultar/procesar
+    FConsultaLiqActiva: Boolean;
+    FConsultaLiqActivaFechaTurno: TDateTime;
+    FConsultaLiqActivaNoTurno: Integer;
+    FConsultaLiqActivaEstacion: Integer;
     procedure VerificarVales;
     function ValidaEstatusLiq:Boolean;
     function DameVolumenAjusteDGASAJUD2(const AEstacion: Integer;
@@ -248,6 +253,13 @@ type
       const AEstacion: Integer; const AFechaTurno: TDateTime; const ANoTurno: Integer);
     procedure ConsultaLiquidacionAPIAlCerrarTurno(const AFechaIni, AFechaFin, AFechaTurno: TDateTime;
       const ANoTurno, AEstacion: Integer);
+    function ConsultaLiquidacionAPIYaProgramada(const AFechaTurno: TDateTime;
+      const ANoTurno, AEstacion: Integer): Boolean;
+    procedure EncolaConsultaLiquidacionAPI(const AFechaIni, AFechaFin, AFechaTurno: TDateTime;
+      const ANoTurno, AEstacion: Integer);
+    procedure IniciaSiguienteConsultaLiquidacionAPI;
+    procedure FinalizaConsultaLiquidacionAPI(AThread: TThread);
+    procedure LimpiaColaConsultaLiquidacionAPI;
   public
     { Public declarations }
     procedure RefrescaTabla;
@@ -290,6 +302,15 @@ const
 
 type
   TModoRepartoAjuste = (mraPartesIguales, mraProporcional);
+
+var
+  // Cache del token de la API de liquidaciones.
+  // Durante el cierre de dia se consultan varios turnos; no tiene sentido
+  // pedir /auth/token por cada turno si ya se obtuvo correctamente una vez.
+  GLiqApiAccessTokenCache: string;
+  GLiqApiTokenTypeCache: string;
+  GLiqApiTokenSolicitado: Boolean;
+  GLiqApiTokenCS: TRTLCriticalSection;
 
 function LiqApiRemoveTrailingSlash(const S: string): string;
 begin
@@ -452,7 +473,7 @@ begin
   Result := FormatDateTime('yyyy-mm-dd', AValue);
 end;
 
-function LiqApiObtenerToken(var AAccessToken, ATokenType: string): Boolean;
+function LiqApiSolicitarTokenAPI(var AAccessToken, ATokenType: string): Boolean;
 var
   Url: string;
   Body: string;
@@ -497,6 +518,49 @@ begin
 
   AAccessToken := StringReplace(Token, 'Bearer ', '', [rfIgnoreCase]);
   Result := True;
+end;
+
+function LiqApiObtenerToken(var AAccessToken, ATokenType: string): Boolean;
+var
+  NuevoAccessToken: string;
+  NuevoTokenType: string;
+begin
+  Result := False;
+  AAccessToken := '';
+  ATokenType := '';
+
+  // El token se pide una sola vez por ejecucion de la unidad/proceso.
+  // Si varios turnos entran casi al mismo tiempo, el CriticalSection evita
+  // que todos disparen /auth/token simultaneamente.
+  EnterCriticalSection(GLiqApiTokenCS);
+  try
+    if GLiqApiTokenSolicitado and (Trim(GLiqApiAccessTokenCache) <> '') then begin
+      AAccessToken := GLiqApiAccessTokenCache;
+      ATokenType := GLiqApiTokenTypeCache;
+      if Trim(ATokenType) = '' then
+        ATokenType := 'Bearer';
+
+      Result := True;
+      Exit;
+    end;
+
+    NuevoAccessToken := '';
+    NuevoTokenType := '';
+
+    if LiqApiSolicitarTokenAPI(NuevoAccessToken, NuevoTokenType) then begin
+      GLiqApiAccessTokenCache := NuevoAccessToken;
+      GLiqApiTokenTypeCache := NuevoTokenType;
+      if Trim(GLiqApiTokenTypeCache) = '' then
+        GLiqApiTokenTypeCache := 'Bearer';
+      GLiqApiTokenSolicitado := True;
+
+      AAccessToken := GLiqApiAccessTokenCache;
+      ATokenType := GLiqApiTokenTypeCache;
+      Result := True;
+    end;
+  finally
+    LeaveCriticalSection(GLiqApiTokenCS);
+  end;
 end;
 
 function LiqApiStrToFloatDef(const S: string; const ADefault: Double): Double;
@@ -846,7 +910,7 @@ begin
     Q_Auxi.Close;
     Q_Auxi.SQL.Clear;
     Q_AuxiReal1.FieldKind:=fkInternalCalc;
-    Q_Auxi.SQL.Add('select coalesce(sum(volumen),0) as Real1');
+    Q_Auxi.SQL.Add('select coalesce(sum(diferencia),0) as Real1');
     Q_Auxi.SQL.Add('from DGASAJUD2');
     Q_Auxi.SQL.Add('where Estacion='+IntToStr(AEstacion));
     Q_Auxi.SQL.Add('  and Fecha='+QuotedStr(FechaToStrSQL(AFechaTurno)));
@@ -1042,10 +1106,9 @@ begin
   if Trim(AJsonLiquidacion) = '' then
     Exit;
 
-  // El ajuste de DGASAJUD2 se aplica una sola vez al dia y, por regla de
-  // negocio actual, solo debe impactar el turno 3. En otros turnos dejamos
-  // el JSON de la API intacto para no poner diferenciaLecturas2 en cero ni
-  // duplicar el ajuste diario.
+  // El ajuste de DGASAJUD2 se aplica por turno. El cierre del turno maximo
+  // del dia programa las consultas de cada turno y la cola garantiza que se
+  // procesen una por una, sin pisarse entre si.
 
   Modo := LiqApiModoRepartoAjuste;
 
@@ -1084,6 +1147,15 @@ end;
 //    hilo principal dentro de EntregaResultado (via Synchronize).
 // ===========================================================================
 type
+  TLiqApiConsultaLiqItem = class
+  public
+    FechaIni: TDateTime;
+    FechaFin: TDateTime;
+    FechaTurno: TDateTime;
+    NoTurno: Integer;
+    Estacion: Integer;
+  end;
+
   TLiqApiConsultaLiqThread = class(TThread)
   private
     FFormulario: TFLIQTURC;        // se toca solo desde el hilo principal; nil = desvinculado
@@ -1164,60 +1236,174 @@ begin
     Exit;
 
   try
-    if FError <> '' then
-      raise Exception.Create(FError);
+    try
+      if FError <> '' then
+        raise Exception.Create(FError);
 
-    // El ajuste por manguera lee DGASAJUD2: correcto ejecutarlo aqui.
-    FFormulario.AplicarAjusteDGASAJUD2Json(FJson, FEstacion, FFechaTurno, FNoTurno);
-    FFormulario.FJsonLiquidacionAPI := FJson;
+      // El ajuste por manguera lee DGASAJUD2: correcto ejecutarlo aqui.
+      FFormulario.AplicarAjusteDGASAJUD2Json(FJson, FEstacion, FFechaTurno, FNoTurno);
+      FFormulario.FJsonLiquidacionAPI := FJson;
 
-    jsonStr:=TStringList.Create();
-    jsonStr.Add(FJson);
-    jsonStr.SaveToFile('C:\ImagenCo\JsonLiq.txt');
+      jsonStr:=TStringList.Create();
+      try
+        jsonStr.Add(FJson);
+        jsonStr.SaveToFile('C:\ImagenCo\JsonLiq_Turno'+IntToStr(FNoTurno)+'.txt');
+      finally
+        jsonStr.Free;
+      end;
 
-    // Aqui puede agregarse la persistencia/envio posterior del JSON ajustado,
-    // usando FEstacion, FFechaTurno, FNoTurno y FJson.
-  except
-    on E: Exception do
-      MensajeWarn('El turno se cerro, pero no fue posible aplicar/consultar la '
-        + 'liquidacion en la API.' + #13 + E.Message);
+      // Aqui puede agregarse la persistencia/envio posterior del JSON ajustado,
+      // usando FEstacion, FFechaTurno, FNoTurno y FJson.
+    except
+      on E: Exception do
+        MensajeWarn('El turno se cerro, pero no fue posible aplicar/consultar la '
+          + 'liquidacion en la API del turno '+IntToStr(FNoTurno)+'.' + #13 + E.Message);
+    end;
+  finally
+    // Libera el turno activo y dispara el siguiente pendiente.
+    if FFormulario <> nil then
+      FFormulario.FinalizaConsultaLiquidacionAPI(Self);
   end;
-
-  // El formulario ya no debe apuntar a este hilo cuando el hilo termine y se libere.
-  if FFormulario.FHiloConsultaLiq = Self then
-    FFormulario.FHiloConsultaLiq := nil;
 end;
 
 procedure TFLIQTURC.ConsultaLiquidacionAPIAlCerrarTurno(const AFechaIni, AFechaFin, AFechaTurno: TDateTime;
   const ANoTurno, AEstacion: Integer);
+begin
+  // Ya no se crea un hilo por llamada dejando atras el anterior.
+  // Durante el cierre del turno maximo del dia se pueden programar varios
+  // turnos muy rapido; por eso se encolan y se procesan uno por uno.
+  EncolaConsultaLiquidacionAPI(AFechaIni, AFechaFin, AFechaTurno, ANoTurno, AEstacion);
+end;
+
+function TFLIQTURC.ConsultaLiquidacionAPIYaProgramada(const AFechaTurno: TDateTime;
+  const ANoTurno, AEstacion: Integer): Boolean;
 var
+  I: Integer;
+  Item: TLiqApiConsultaLiqItem;
+begin
+  Result := False;
+
+  // Evita duplicar el mismo turno cuando el ciclo de ajustes recorre varios
+  // combustibles del mismo turno. La consulta a la API debe hacerse una sola
+  // vez por estacion/fecha/turno, no una vez por combustible.
+  if FConsultaLiqActiva and
+     (FConsultaLiqActivaNoTurno = ANoTurno) and
+     (FConsultaLiqActivaEstacion = AEstacion) and
+     (Trunc(FConsultaLiqActivaFechaTurno) = Trunc(AFechaTurno)) then begin
+    Result := True;
+    Exit;
+  end;
+
+  if not Assigned(FColaConsultaLiq) then
+    Exit;
+
+  for I := 0 to FColaConsultaLiq.Count - 1 do begin
+    Item := TLiqApiConsultaLiqItem(FColaConsultaLiq[I]);
+    if Assigned(Item) and
+       (Item.NoTurno = ANoTurno) and
+       (Item.Estacion = AEstacion) and
+       (Trunc(Item.FechaTurno) = Trunc(AFechaTurno)) then begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+procedure TFLIQTURC.EncolaConsultaLiquidacionAPI(const AFechaIni, AFechaFin, AFechaTurno: TDateTime;
+  const ANoTurno, AEstacion: Integer);
+var
+  Item: TLiqApiConsultaLiqItem;
+begin
+  if ConsultaLiquidacionAPIYaProgramada(AFechaTurno, ANoTurno, AEstacion) then
+    Exit;
+
+  if not Assigned(FColaConsultaLiq) then
+    FColaConsultaLiq := TList.Create;
+
+  Item := TLiqApiConsultaLiqItem.Create;
+  Item.FechaIni := AFechaIni;
+  Item.FechaFin := AFechaFin;
+  Item.FechaTurno := AFechaTurno;
+  Item.NoTurno := ANoTurno;
+  Item.Estacion := AEstacion;
+
+  FColaConsultaLiq.Add(Item);
+
+  // Si no hay consulta activa, arranca de inmediato. Si ya hay una, queda
+  // pendiente y se ejecutara al terminar la actual.
+  IniciaSiguienteConsultaLiquidacionAPI;
+end;
+
+procedure TFLIQTURC.IniciaSiguienteConsultaLiquidacionAPI;
+var
+  Item: TLiqApiConsultaLiqItem;
   Hilo: TLiqApiConsultaLiqThread;
 begin
-  // Limpia el JSON anterior: si la consulta falla, no debe quedar en memoria
-  // informacion de otro turno.
-  FJsonLiquidacionAPI := '';
+  if Assigned(FHiloConsultaLiq) then
+    Exit;
 
-  // Si quedo un hilo de un turno previo en vuelo, lo desvinculamos para que su
-  // resultado no escriba sobre el formulario fuera de contexto.
-  if Assigned(FHiloConsultaLiq) then begin
-    TLiqApiConsultaLiqThread(FHiloConsultaLiq).OlvidaFormulario;
-    FHiloConsultaLiq := nil;
-  end;
+  if (not Assigned(FColaConsultaLiq)) or (FColaConsultaLiq.Count = 0) then
+    Exit;
 
-  // El HTTP (token + consulta) corre en segundo plano para no congelar la UI.
-  // El ajuste por manguera, que toca BD, se ejecuta despues en el hilo principal.
-  Hilo := TLiqApiConsultaLiqThread.Create(
-    Self, AFechaIni, AFechaFin, AFechaTurno, ANoTurno, AEstacion);
-  FHiloConsultaLiq := Hilo;
+  Item := TLiqApiConsultaLiqItem(FColaConsultaLiq[0]);
+  FColaConsultaLiq.Delete(0);
 
   try
-    // Delphi clasico: Resume. En Delphi 2010+ se usaria Start.
-    Hilo.Resume;
-  except
-    FHiloConsultaLiq := nil;
-    Hilo.Free;
-    raise;
+    // Limpia el JSON anterior justo antes de iniciar el turno que toca.
+    // Asi, si este turno falla, no queda en memoria el JSON del anterior.
+    FJsonLiquidacionAPI := '';
+
+    FConsultaLiqActiva := True;
+    FConsultaLiqActivaFechaTurno := Item.FechaTurno;
+    FConsultaLiqActivaNoTurno := Item.NoTurno;
+    FConsultaLiqActivaEstacion := Item.Estacion;
+
+    // El HTTP (token + consulta) corre en segundo plano para no congelar la UI.
+    // El ajuste por manguera, que toca BD, se ejecuta despues en el hilo principal.
+    Hilo := TLiqApiConsultaLiqThread.Create(
+      Self, Item.FechaIni, Item.FechaFin, Item.FechaTurno, Item.NoTurno, Item.Estacion);
+    FHiloConsultaLiq := Hilo;
+
+    try
+      // Delphi clasico: Resume. En Delphi 2010+ se usaria Start.
+      Hilo.Resume;
+    except
+      FHiloConsultaLiq := nil;
+      FConsultaLiqActiva := False;
+      Hilo.Free;
+      raise;
+    end;
+  finally
+    Item.Free;
   end;
+end;
+
+procedure TFLIQTURC.FinalizaConsultaLiquidacionAPI(AThread: TThread);
+begin
+  if FHiloConsultaLiq = AThread then
+    FHiloConsultaLiq := nil;
+
+  FConsultaLiqActiva := False;
+  FConsultaLiqActivaFechaTurno := 0;
+  FConsultaLiqActivaNoTurno := 0;
+  FConsultaLiqActivaEstacion := 0;
+
+  // Continua con el siguiente turno pendiente, si lo hay.
+  IniciaSiguienteConsultaLiquidacionAPI;
+end;
+
+procedure TFLIQTURC.LimpiaColaConsultaLiquidacionAPI;
+var
+  I: Integer;
+begin
+  if not Assigned(FColaConsultaLiq) then
+    Exit;
+
+  for I := 0 to FColaConsultaLiq.Count - 1 do
+    TLiqApiConsultaLiqItem(FColaConsultaLiq[I]).Free;
+
+  FColaConsultaLiq.Clear;
+  FreeAndNil(FColaConsultaLiq);
 end;
 
 procedure TFLIQTURC.PreparaForma(xModo:integer);
@@ -1329,9 +1515,15 @@ end;
 
 procedure TFLIQTURC.FormClose(Sender: TObject; var Action: TCloseAction);
 begin
-  // Si hay una consulta de liquidacion en segundo plano, la desvinculamos para
-  // que no intente tocar este formulario despues de cerrarse. El hilo terminara
-  // solo (FreeOnTerminate).
+  // Descarta turnos pendientes. Si hay una consulta en vuelo, se desvincula
+  // para que al terminar no toque este formulario. No se usa WaitFor para no
+  // congelar la aplicacion ni provocar deadlocks con Synchronize.
+  LimpiaColaConsultaLiquidacionAPI;
+  FConsultaLiqActiva := False;
+  FConsultaLiqActivaFechaTurno := 0;
+  FConsultaLiqActivaNoTurno := 0;
+  FConsultaLiqActivaEstacion := 0;
+
   if Assigned(FHiloConsultaLiq) then begin
     TLiqApiConsultaLiqThread(FHiloConsultaLiq).OlvidaFormulario;
     FHiloConsultaLiq := nil;
@@ -2915,8 +3107,7 @@ begin
                       Q_Auxi.ExecSQL;
 
                       try
-                        ConsultaLiquidacionAPIAlCerrarTurno(LiqApiCombinaFechaHora(T_TurcFECHA.AsDateTime), LiqApiCombinaFechaHora(T_TurcFECHA.AsDateTime),
-                          T_TurcFecha.AsDateTime, Q_AuxiAjusEntero1.AsInteger, T_TurcEstacion.AsInteger);
+                        ConsultaLiquidacionAPIAlCerrarTurno(T_TurcFECHA.AsDateTime, T_TurcFECHA.AsDateTime,T_TurcFecha.AsDateTime, Q_AuxiAjusEntero1.AsInteger, T_TurcEstacion.AsInteger);
                       except
                         on E: Exception do
                           raise Exception.Create('Error al consultar API: '+e.Message);
@@ -3644,5 +3835,14 @@ begin
     QL_Turc.FreeBookmark(bm);
   end;
 end;
+
+initialization
+  GLiqApiAccessTokenCache := '';
+  GLiqApiTokenTypeCache := 'Bearer';
+  GLiqApiTokenSolicitado := False;
+  InitializeCriticalSection(GLiqApiTokenCS);
+
+finalization
+  DeleteCriticalSection(GLiqApiTokenCS);
 
 end.
