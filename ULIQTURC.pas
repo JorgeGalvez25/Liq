@@ -3073,9 +3073,11 @@ procedure TFLIQTURC.CerrarTurno1Click(Sender: TObject);
 var LClaseCred,
     LClaseCupo,
     LClaseTarj:TStringList;
-    i:word;
+    i:Integer;
     bm:tBookMark;
     xturno : Integer;
+    TurnosConsultaAPI: TStringList;
+    DebeConsultarLiqDiaAPI: Boolean;
 begin
   with DMGEN,DMGAS,DMLIQ do begin
     if ModoProc=1 then
@@ -3097,6 +3099,9 @@ begin
     LClaseCred:=TStringList.Create;
     LClaseCupo:=TStringList.Create;
     LClaseTarj:=TStringList.Create;
+    TurnosConsultaAPI:=TStringList.Create;
+    TurnosConsultaAPI.Sorted:=True;
+    TurnosConsultaAPI.Duplicates:=dupIgnore;
     try
       bm:=QL_Turc.GetBookmark;
       if not LocalizaTabla(T_Turc,'Estacion;Caja;Estatus',VarArrayOf([EstacionActual,CajaActual,'A'])) then
@@ -3153,7 +3158,7 @@ begin
         end;
       end;        
 /////////////////////////////////////////////////////////////////
-      if MensajeConf('ï¿½Desea cerrar el turno?')=mrYes then begin
+      if MensajeConf('¿Desea cerrar el turno?')=mrYes then begin
 //        VerificarVales;
         if VarGasValidarValesyCupones='Si' then begin
           T_Tpag.Active:=true;
@@ -3284,6 +3289,8 @@ begin
                       xturno := xturno + 1;
                     until xturno>VarGasMaximoTurnosLiq;
 
+                    TurnosConsultaAPI.Clear;
+
                     Q_AuxiAjus.Close;
                     Q_AuxiAjus.SQL.Clear;
                     Q_AuxiAjusReal1.FieldKind:=fkInternalCalc;
@@ -3316,17 +3323,29 @@ begin
                       Q_Auxi.SQL.Add('  and turno = '+IntToStr(Q_AuxiAjusEntero1.AsInteger));
                       Q_Auxi.ExecSQL;
 
-                      try
-                        ConsultaLiquidacionAPIAlCerrarTurno(T_TurcFECHA.AsDateTime, T_TurcFECHA.AsDateTime,T_TurcFecha.AsDateTime, Q_AuxiAjusEntero1.AsInteger, T_TurcEstacion.AsInteger);
-                      except
-                        on E: Exception do
-                          raise Exception.Create('Error al consultar API: '+e.Message);
-                      end;
+                      // La consulta a la API no debe ejecutarse por combustible.
+                      // Se registra el turno afectado y se consulta una sola vez
+                      // al terminar de actualizar DGASAJUD2.
+                      TurnosConsultaAPI.Add(IntToStr(Q_AuxiAjusEntero1.AsInteger));
 
                       Q_AuxiAjus.Next;
                     end;
                     Q_AuxiAjus.Close;
                     Q_Auxi.Close;
+
+                    for i := 0 to TurnosConsultaAPI.Count - 1 do begin
+                      try
+                        ConsultaLiquidacionAPIAlCerrarTurno(
+                          T_TurcFECHA.AsDateTime,
+                          T_TurcFECHA.AsDateTime,
+                          T_TurcFecha.AsDateTime,
+                          StrToInt(TurnosConsultaAPI[i]),
+                          T_TurcEstacion.AsInteger);
+                      except
+                        on E: Exception do
+                          raise Exception.Create('Error al consultar API: '+e.Message);
+                      end;
+                    end;
                   end else
                   begin
                     if not LocalizaTabla(TL_Ajud,'ESTACION;FECHA',VarArrayOf([T_TurcESTACION.AsInteger,T_TurcFECHA.AsDateTime])) then begin
@@ -3351,6 +3370,7 @@ begin
                       TL_Ajud2.Open;
                     TL_Ajud2.Refresh;
                     TL_Ajud2.First;
+                    DebeConsultarLiqDiaAPI := False;
                     while not TL_Ajud2.Eof do begin
                       try
                         Q_AuxiAjus.Close;
@@ -3362,18 +3382,28 @@ begin
                         if not Q_AuxiAjus.IsEmpty then begin
                           TL_Ajud2.Edit;
                           TL_Ajud2VOLUMEN.AsFloat:=TL_Ajud2VENTA.AsFloat-Q_AuxiAjusReal1.AsFloat;
-                          TL_Ajud2.Post;   
-                          try
-                            ConsultaLiquidacionAPIAlCerrarTurno(T_TurcFECHA.AsDateTime, T_TurcFECHA.AsDateTime,T_TurcFecha.AsDateTime, 0, T_TurcEstacion.AsInteger);
-                          except
-                            on E: Exception do
-                              raise Exception.Create('Error al consultar API: '+e.Message);
-                          end;
+                          TL_Ajud2.Post;
+                          // En ajuste diario, la API se consulta una sola vez por fecha.
+                          DebeConsultarLiqDiaAPI := True;
                         end;
                       finally
                         Q_AuxiAjus.Close;
                       end;
                       TL_Ajud2.Next;
+                    end;
+
+                    if DebeConsultarLiqDiaAPI then begin
+                      try
+                        ConsultaLiquidacionAPIAlCerrarTurno(
+                          T_TurcFECHA.AsDateTime,
+                          T_TurcFECHA.AsDateTime,
+                          T_TurcFecha.AsDateTime,
+                          0,
+                          T_TurcEstacion.AsInteger);
+                      except
+                        on E: Exception do
+                          raise Exception.Create('Error al consultar API: '+e.Message);
+                      end;
                     end;
                   end;
                   DBAJUS1.Close;
@@ -3414,6 +3444,7 @@ begin
       LClaseCred.Free;
       LClaseCupo.Free;
       LClaseTarj.Free;
+      TurnosConsultaAPI.Free;
     end;
   end;
 end;
