@@ -594,14 +594,6 @@ begin
   end;
 end;
 
-function LiqApiCombinaFechaHora(const AFecha, AHora: TDateTime): TDateTime;
-begin
-  if Trunc(AHora) = 0 then
-    Result := Trunc(AFecha) + Frac(AHora)
-  else
-    Result := AHora;
-end;
-
 function LiqApiFormatDateParam(const AValue: TDateTime): string;
 begin
   // La API de liquidaciones espera la fecha del turno sin hora.
@@ -609,13 +601,19 @@ begin
   Result := FormatDateTime('yyyy-mm-dd', AValue);
 end;
 
+function LiqApiNormalizaTokenType(const ATokenType: string): string;
+begin
+  Result := Trim(ATokenType);
+  if Result = '' then
+    Result := 'Bearer';
+end;
+
 function LiqApiSolicitarTokenAPI(var AAccessToken, ATokenType: string): Boolean;
+const
+  CAMPOS_TOKEN: array[0..2] of string = ('access_token', 'token', 'id_token');
 var
-  Url: string;
-  Body: string;
-  Status: Integer;
-  Resp: string;
-  Token: string;
+  Url, Body, Resp, Token: string;
+  Status, I: Integer;
 begin
   Result := False;
   AAccessToken := '';
@@ -626,40 +624,31 @@ begin
           '&password=' + LiqApiUrlEncode(LIQ_API_PASSWORD) +
           '&grant_type=password';
 
-  LiqApiHttpRequest(
-    'POST',
-    Url,
-    Body,
-    '',
-    'application/x-www-form-urlencoded',
-    Status,
-    Resp
-  );
+  LiqApiHttpRequest('POST', Url, Body, '',
+    'application/x-www-form-urlencoded', Status, Resp);
 
   if not (Status in [200, 201]) then
-    raise Exception.Create('La API no regreso exito al solicitar token. HTTP ' + IntToStr(Status) + #13 + Resp);
+    raise Exception.Create('La API no regreso exito al solicitar token. HTTP ' +
+      IntToStr(Status) + #13 + Resp);
 
-  Token := LiqApiExtractJsonStringValue(Resp, 'access_token');
-  if Token = '' then
-    Token := LiqApiExtractJsonStringValue(Resp, 'token');
-  if Token = '' then
-    Token := LiqApiExtractJsonStringValue(Resp, 'id_token');
-
-  ATokenType := LiqApiExtractJsonStringValue(Resp, 'token_type');
-  if ATokenType = '' then
-    ATokenType := 'Bearer';
+  Token := '';
+  for I := Low(CAMPOS_TOKEN) to High(CAMPOS_TOKEN) do begin
+    Token := LiqApiExtractJsonStringValue(Resp, CAMPOS_TOKEN[I]);
+    if Token <> '' then
+      Break;
+  end;
 
   if Token = '' then
     raise Exception.Create('No se encontro access_token/token/id_token en la respuesta del token.' + #13 + Resp);
 
+  ATokenType := LiqApiNormalizaTokenType(LiqApiExtractJsonStringValue(Resp, 'token_type'));
   AAccessToken := StringReplace(Token, 'Bearer ', '', [rfIgnoreCase]);
   Result := True;
 end;
 
 function LiqApiObtenerToken(var AAccessToken, ATokenType: string): Boolean;
 var
-  NuevoAccessToken: string;
-  NuevoTokenType: string;
+  NuevoAccessToken, NuevoTokenType: string;
 begin
   Result := False;
   AAccessToken := '';
@@ -672,10 +661,7 @@ begin
   try
     if GLiqApiTokenSolicitado and (Trim(GLiqApiAccessTokenCache) <> '') then begin
       AAccessToken := GLiqApiAccessTokenCache;
-      ATokenType := GLiqApiTokenTypeCache;
-      if Trim(ATokenType) = '' then
-        ATokenType := 'Bearer';
-
+      ATokenType := LiqApiNormalizaTokenType(GLiqApiTokenTypeCache);
       Result := True;
       Exit;
     end;
@@ -685,9 +671,7 @@ begin
 
     if LiqApiSolicitarTokenAPI(NuevoAccessToken, NuevoTokenType) then begin
       GLiqApiAccessTokenCache := NuevoAccessToken;
-      GLiqApiTokenTypeCache := NuevoTokenType;
-      if Trim(GLiqApiTokenTypeCache) = '' then
-        GLiqApiTokenTypeCache := 'Bearer';
+      GLiqApiTokenTypeCache := LiqApiNormalizaTokenType(NuevoTokenType);
       GLiqApiTokenSolicitado := True;
 
       AAccessToken := GLiqApiAccessTokenCache;
@@ -720,19 +704,23 @@ begin
   end;
 end;
 
+function LiqApiJsonField(AObj: TlkJSONobject; const AName: string): TlkJSONbase;
+begin
+  Result := nil;
+  if not Assigned(AObj) then
+    Exit;
+  Result := AObj.Field[AName];
+  if Assigned(Result) and (Result is TlkJSONnull) then
+    Result := nil;
+end;
+
 function LiqApiJsonStringDef(AObj: TlkJSONobject; const AName, ADefault: string): string;
 var
   JValue: TlkJSONbase;
 begin
   Result := ADefault;
-  if not Assigned(AObj) then
-    Exit;
-
-  JValue := AObj.Field[AName];
+  JValue := LiqApiJsonField(AObj, AName);
   if not Assigned(JValue) then
-    Exit;
-
-  if JValue is TlkJSONnull then
     Exit;
 
   try
@@ -747,14 +735,8 @@ var
   JValue: TlkJSONbase;
 begin
   Result := ADefault;
-  if not Assigned(AObj) then
-    Exit;
-
-  JValue := AObj.Field[AName];
+  JValue := LiqApiJsonField(AObj, AName);
   if not Assigned(JValue) then
-    Exit;
-
-  if JValue is TlkJSONnull then
     Exit;
 
   try
@@ -955,36 +937,6 @@ begin
   Result := FechaJson = FormatDateTime('yyyy-mm-dd', AFechaTurno);
 end;
 
-function LiqApiDetalleCoincideAjuste(AObj: TlkJSONobject; const AFechaTurno: TDateTime;
-  const ANoTurno, ANoCombustible: Integer): Boolean;
-begin
-  Result := Assigned(AObj) and
-            ((ANoTurno = 0) or (LiqApiJsonIntegerDef(AObj, 'noTurno', 0) = ANoTurno)) and
-            (LiqApiJsonIntegerDef(AObj, 'noCombustible', 0) = ANoCombustible) and
-            LiqApiFechaJsonIgual(LiqApiJsonStringDef(AObj, 'fechaTurno', ''), AFechaTurno);
-end;
-
-function LiqApiCuentaManguerasAjuste(AJson: TlkJSONbase; const AFechaTurno: TDateTime;
-  const ANoTurno, ANoCombustible: Integer): Integer;
-var
-  I: Integer;
-begin
-  Result := 0;
-  if not Assigned(AJson) then
-    Exit;
-
-  if AJson is TlkJSONlist then begin
-    for I := 0 to AJson.Count - 1 do begin
-      if (AJson.Child[I] is TlkJSONobject) and
-         LiqApiDetalleCoincideAjuste(TlkJSONobject(AJson.Child[I]), AFechaTurno, ANoTurno, ANoCombustible) then
-        Inc(Result);
-    end;
-  end
-  else if (AJson is TlkJSONobject) and
-          LiqApiDetalleCoincideAjuste(TlkJSONobject(AJson), AFechaTurno, ANoTurno, ANoCombustible) then
-    Result := 1;
-end;
-
 procedure LiqApiAsignaDiferenciaLecturas2(AObj: TlkJSONobject; const AValor: Double);
 var
   Campo: TlkJSONbase;
@@ -1161,6 +1113,15 @@ var
     Grupos[GrupoIndex].Mangueras[MangueraIndex].LitrosApi := LitrosManguera;
   end;
 
+  // Orden estable por (NoTurno, NoManguera): True si A va antes que B.
+  // Centraliza el desempate que antes estaba repetido en el orden y en la
+  // seleccion de la manguera residual.
+  function MangueraVaAntes(const A, B: TMangueraAjuste): Boolean;
+  begin
+    Result := (A.NoTurno < B.NoTurno) or
+              ((A.NoTurno = B.NoTurno) and (A.NoManguera < B.NoManguera));
+  end;
+
   procedure OrdenaManguerasPorNumero(var AGrupo: TGrupoCombustibleAjuste);
   var
     I, J: Integer;
@@ -1169,10 +1130,7 @@ var
     for I := 1 to High(AGrupo.Mangueras) do begin
       Tmp := AGrupo.Mangueras[I];
       J := I - 1;
-      while (J >= 0) and
-            ((AGrupo.Mangueras[J].NoTurno > Tmp.NoTurno) or
-             ((AGrupo.Mangueras[J].NoTurno = Tmp.NoTurno) and
-              (AGrupo.Mangueras[J].NoManguera > Tmp.NoManguera))) do begin
+      while (J >= 0) and MangueraVaAntes(Tmp, AGrupo.Mangueras[J]) do begin
         AGrupo.Mangueras[J + 1] := AGrupo.Mangueras[J];
         Dec(J);
       end;
@@ -1183,14 +1141,16 @@ var
   function IndiceMangueraResidual(const AGrupo: TGrupoCombustibleAjuste): Integer;
   var
     I: Integer;
+    EsMejor: Boolean;
   begin
     Result := 0;
     for I := 1 to High(AGrupo.Mangueras) do begin
-      if (AGrupo.Mangueras[I].PesoLitros > AGrupo.Mangueras[Result].PesoLitros) or
-         ((AGrupo.Mangueras[I].PesoLitros = AGrupo.Mangueras[Result].PesoLitros) and
-          ((AGrupo.Mangueras[I].NoTurno > AGrupo.Mangueras[Result].NoTurno) or
-           ((AGrupo.Mangueras[I].NoTurno = AGrupo.Mangueras[Result].NoTurno) and
-            (AGrupo.Mangueras[I].NoManguera > AGrupo.Mangueras[Result].NoManguera)))) then
+      // Mayor peso; a igualdad de peso, la manguera "posterior" en (turno, no).
+      EsMejor :=
+        (AGrupo.Mangueras[I].PesoLitros > AGrupo.Mangueras[Result].PesoLitros) or
+        ((AGrupo.Mangueras[I].PesoLitros = AGrupo.Mangueras[Result].PesoLitros) and
+         MangueraVaAntes(AGrupo.Mangueras[Result], AGrupo.Mangueras[I]));
+      if EsMejor then
         Result := I;
     end;
   end;
