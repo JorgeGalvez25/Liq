@@ -959,7 +959,7 @@ function LiqApiDetalleCoincideAjuste(AObj: TlkJSONobject; const AFechaTurno: TDa
   const ANoTurno, ANoCombustible: Integer): Boolean;
 begin
   Result := Assigned(AObj) and
-            (LiqApiJsonIntegerDef(AObj, 'noTurno', 0) = ANoTurno) and
+            ((ANoTurno = 0) or (LiqApiJsonIntegerDef(AObj, 'noTurno', 0) = ANoTurno)) and
             (LiqApiJsonIntegerDef(AObj, 'noCombustible', 0) = ANoCombustible) and
             LiqApiFechaJsonIgual(LiqApiJsonStringDef(AObj, 'fechaTurno', ''), AFechaTurno);
 end;
@@ -1050,7 +1050,14 @@ begin
     Q_Auxi.SQL.Add('from DGASAJUD2');
     Q_Auxi.SQL.Add('where Estacion='+IntToStr(AEstacion));
     Q_Auxi.SQL.Add('  and Fecha='+QuotedStr(FechaToStrSQL(AFechaTurno)));
-    Q_Auxi.SQL.Add('  and Turno='+IntToStr(ANoTurno));
+
+    // Cuando ANoTurno = 0, la consulta a la API es por dia completo.
+    // En ese caso DGASAJUD2 tambien se toma acumulado por dia/combustible,
+    // sin filtrar turno, para repartirlo entre las mangueras de todos los turnos.
+    // Si ANoTurno <> 0, se conserva el comportamiento ya probado por turno.
+    if ANoTurno <> 0 then
+      Q_Auxi.SQL.Add('  and Turno='+IntToStr(ANoTurno));
+
     Q_Auxi.SQL.Add('  and Combustible='+IntToStr(ANoCombustible));
     Q_Auxi.Prepare;
     Q_Auxi.Open;
@@ -1070,9 +1077,10 @@ begin
   Result := 0;
 
   // Devuelve la magnitud que se reparte en diferenciaLecturas2.
-  // IMPORTANTE: hoy DGASAJUD2.volumen contiene el valor neto guardado por el
-  // cierre local. Si el contrato de la API pide otro delta, debe cambiarse aqui
-  // la fuente del dato, no el algoritmo de reparto.
+  // Si ANoTurno = 0, la magnitud se toma acumulada por dia/combustible.
+  // Si ANoTurno <> 0, la magnitud se toma por turno/combustible.
+  // Si el contrato de la API pide otro delta, debe cambiarse aqui la fuente
+  // del dato, no el algoritmo de reparto.
 
   Result := DameVolumenAjusteDGASAJUD2(AEstacion, AFechaTurno, ANoTurno, ANoCombustible);
 end;
@@ -1082,6 +1090,7 @@ procedure TFLIQTURC.AplicarAjusteDGASAJUD2Json(var AJsonLiquidacion: string;
 type
   TMangueraAjuste = record
     Obj: TlkJSONobject;
+    NoTurno: Integer;
     NoManguera: Integer;
     PesoLitros: Double;
     LitrosApi: Double;
@@ -1129,7 +1138,7 @@ var
     if not Assigned(AObj) then
       Exit;
 
-    if (LiqApiJsonIntegerDef(AObj, 'noTurno', 0) <> ANoTurno) or
+    if ((ANoTurno <> 0) and (LiqApiJsonIntegerDef(AObj, 'noTurno', 0) <> ANoTurno)) or
        not LiqApiFechaJsonIgual(LiqApiJsonStringDef(AObj, 'fechaTurno', ''), AFechaTurno) then
       Exit;
 
@@ -1144,6 +1153,8 @@ var
     LitrosManguera := LiqApiLitrosManguera(AObj);
 
     Grupos[GrupoIndex].Mangueras[MangueraIndex].Obj := AObj;
+    Grupos[GrupoIndex].Mangueras[MangueraIndex].NoTurno :=
+      LiqApiJsonIntegerDef(AObj, 'noTurno', 0);
     Grupos[GrupoIndex].Mangueras[MangueraIndex].NoManguera :=
       LiqApiJsonIntegerDef(AObj, 'noManguera', 0);
     Grupos[GrupoIndex].Mangueras[MangueraIndex].PesoLitros := LitrosManguera;
@@ -1158,7 +1169,10 @@ var
     for I := 1 to High(AGrupo.Mangueras) do begin
       Tmp := AGrupo.Mangueras[I];
       J := I - 1;
-      while (J >= 0) and (AGrupo.Mangueras[J].NoManguera > Tmp.NoManguera) do begin
+      while (J >= 0) and
+            ((AGrupo.Mangueras[J].NoTurno > Tmp.NoTurno) or
+             ((AGrupo.Mangueras[J].NoTurno = Tmp.NoTurno) and
+              (AGrupo.Mangueras[J].NoManguera > Tmp.NoManguera))) do begin
         AGrupo.Mangueras[J + 1] := AGrupo.Mangueras[J];
         Dec(J);
       end;
@@ -1174,7 +1188,9 @@ var
     for I := 1 to High(AGrupo.Mangueras) do begin
       if (AGrupo.Mangueras[I].PesoLitros > AGrupo.Mangueras[Result].PesoLitros) or
          ((AGrupo.Mangueras[I].PesoLitros = AGrupo.Mangueras[Result].PesoLitros) and
-          (AGrupo.Mangueras[I].NoManguera > AGrupo.Mangueras[Result].NoManguera)) then
+          ((AGrupo.Mangueras[I].NoTurno > AGrupo.Mangueras[Result].NoTurno) or
+           ((AGrupo.Mangueras[I].NoTurno = AGrupo.Mangueras[Result].NoTurno) and
+            (AGrupo.Mangueras[I].NoManguera > AGrupo.Mangueras[Result].NoManguera)))) then
         Result := I;
     end;
   end;
@@ -1195,7 +1211,10 @@ var
 
     OrdenaManguerasPorNumero(AGrupo);
 
-    // VolumenTotal se obtiene de DGASAJUD2.volumen y esta expresado en litros.
+    // VolumenTotal se obtiene de DGASAJUD2 y esta expresado en litros.
+    // Si ANoTurno = 0, es acumulado del dia por combustible y se reparte entre
+    // las mangueras de todos los turnos que vienen en el JSON.
+    // Si ANoTurno <> 0, se mantiene el reparto del turno especifico.
     // diferenciaLecturas2 debe recibir litros, no importe.
     AGrupo.VolumenTotal := DameMagnitudARepartirDGASAJUD2(
       AEstacion, AFechaTurno, ANoTurno, AGrupo.NoCombustible);
@@ -1242,9 +1261,9 @@ begin
   if Trim(AJsonLiquidacion) = '' then
     Exit;
 
-  // El ajuste de DGASAJUD2 se aplica por turno. El cierre del turno maximo
-  // del dia programa las consultas de cada turno y la cola garantiza que se
-  // procesen una por una, sin pisarse entre si.
+  // Si ANoTurno <> 0, el ajuste se aplica al turno especifico.
+  // Si ANoTurno = 0, la API trae informacion general del dia y el ajuste de
+  // DGASAJUD2 se reparte por combustible entre las mangueras de todos los turnos.
 
   Modo := LiqApiModoRepartoAjuste;
 
@@ -1383,7 +1402,10 @@ begin
       jsonStr:=TStringList.Create();
       try
         jsonStr.Add(FJson);
-        jsonStr.SaveToFile('C:\ImagenCo\JsonLiq_Turno'+IntToStr(FNoTurno)+'.txt');
+        if FNoTurno = 0 then
+          jsonStr.SaveToFile('C:\ImagenCo\JsonLiq_Dia.txt')
+        else
+          jsonStr.SaveToFile('C:\ImagenCo\JsonLiq_Turno'+IntToStr(FNoTurno)+'.txt');
       finally
         jsonStr.Free;
       end;
@@ -1392,8 +1414,12 @@ begin
       // usando FEstacion, FFechaTurno, FNoTurno y FJson.
     except
       on E: Exception do
-        MensajeWarn('El turno se cerro, pero no fue posible aplicar/consultar la '
-          + 'liquidacion en la API del turno '+IntToStr(FNoTurno)+'.' + #13 + E.Message);
+        if FNoTurno = 0 then
+          MensajeWarn('El turno se cerro, pero no fue posible aplicar/consultar la '
+            + 'liquidacion diaria en la API.' + #13 + E.Message)
+        else
+          MensajeWarn('El turno se cerro, pero no fue posible aplicar/consultar la '
+            + 'liquidacion en la API del turno '+IntToStr(FNoTurno)+'.' + #13 + E.Message);
     end;
   finally
     // Libera el turno activo y dispara el siguiente pendiente.
@@ -3127,7 +3153,7 @@ begin
         end;
       end;        
 /////////////////////////////////////////////////////////////////
-      if MensajeConf('¿Desea cerrar el turno?')=mrYes then begin
+      if MensajeConf('ï¿½Desea cerrar el turno?')=mrYes then begin
 //        VerificarVales;
         if VarGasValidarValesyCupones='Si' then begin
           T_Tpag.Active:=true;
