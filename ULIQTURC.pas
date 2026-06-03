@@ -243,6 +243,12 @@ type
     FConsultaLiqActivaFechaTurno: TDateTime;
     FConsultaLiqActivaNoTurno: Integer;
     FConsultaLiqActivaEstacion: Integer;
+    FVentanaSyncLiq: TForm;
+    FSpinnerSyncLiq: TPaintBox;
+    FTimerSyncLiq: TTimer;
+    FPasoSyncLiq: Integer;
+    FFormEnabledAntesSync: Boolean;
+    FFormDeshabilitadoPorSync: Boolean;
     procedure VerificarVales;
     function ValidaEstatusLiq:Boolean;
     function DameVolumenAjusteDGASAJUD2(const AEstacion: Integer;
@@ -260,6 +266,12 @@ type
     procedure IniciaSiguienteConsultaLiquidacionAPI;
     procedure FinalizaConsultaLiquidacionAPI(AThread: TThread);
     procedure LimpiaColaConsultaLiquidacionAPI;
+    function HaySincronizacionLiquidacionAPIEnProceso: Boolean;
+    procedure MuestraVentanaSincronizacionLiq;
+    procedure OcultaVentanaSincronizacionLiq;
+    procedure TimerSyncLiqTimer(Sender: TObject);
+    procedure SpinnerSyncLiqPaint(Sender: TObject);
+    procedure VentanaSyncLiqCloseQuery(Sender: TObject; var CanClose: Boolean);
   public
     { Public declarations }
     procedure RefrescaTabla;
@@ -282,7 +294,7 @@ uses ULIBGRAL, DDMGEN, UGEN_NET,  ULIBDATABASE, DDMGAS, DDMGASQ,
   ULIQTURCJT,UAutoriza, ULIQLIQGR, ULIQPVALR, ULIQRCUPR, ULIQRCUP2R,
   ULIQTRANR, ULIQPVALK, DDMAJUS, ULIQFDEP, DDMGENT, ULIQSALISLA, DDMXML,
   UGENXMLMES, UAVANCE, fClientForm, UGASXMLMES, ULIQREP47, DDM_PUNTOS,
-  ComObj, uLkJSON, ActiveX;
+  ComObj, uLkJSON, ActiveX, Math;
 
 {$R *.DFM}
 
@@ -1329,6 +1341,11 @@ begin
 
   FColaConsultaLiq.Add(Item);
 
+  // Mientras haya turnos pendientes/activos se muestra una ventana de espera.
+  // La forma principal queda deshabilitada para que el usuario no cierre la
+  // ventana y deje la sincronizacion incompleta.
+  MuestraVentanaSincronizacionLiq;
+
   // Si no hay consulta activa, arranca de inmediato. Si ya hay una, queda
   // pendiente y se ejecutara al terminar la actual.
   IniciaSiguienteConsultaLiquidacionAPI;
@@ -1390,6 +1407,10 @@ begin
 
   // Continua con el siguiente turno pendiente, si lo hay.
   IniciaSiguienteConsultaLiquidacionAPI;
+
+  // Si ya no hay hilo activo ni turnos pendientes, se oculta la ventana de espera.
+  if not HaySincronizacionLiquidacionAPIEnProceso then
+    OcultaVentanaSincronizacionLiq;
 end;
 
 procedure TFLIQTURC.LimpiaColaConsultaLiquidacionAPI;
@@ -1404,6 +1425,155 @@ begin
 
   FColaConsultaLiq.Clear;
   FreeAndNil(FColaConsultaLiq);
+end;
+
+function TFLIQTURC.HaySincronizacionLiquidacionAPIEnProceso: Boolean;
+begin
+  Result := FConsultaLiqActiva or Assigned(FHiloConsultaLiq) or
+    (Assigned(FColaConsultaLiq) and (FColaConsultaLiq.Count > 0));
+end;
+
+procedure TFLIQTURC.MuestraVentanaSincronizacionLiq;
+var
+  Lbl: TLabel;
+begin
+  if not Assigned(FVentanaSyncLiq) then begin
+    FVentanaSyncLiq := TForm.CreateNew(Self);
+    FVentanaSyncLiq.BorderStyle := bsDialog;
+    FVentanaSyncLiq.BorderIcons := [];
+    FVentanaSyncLiq.Caption := 'Sincronizando';
+    FVentanaSyncLiq.ClientWidth := 390;
+    FVentanaSyncLiq.ClientHeight := 118;
+    FVentanaSyncLiq.Position := poDesigned;
+    FVentanaSyncLiq.FormStyle := fsStayOnTop;
+    FVentanaSyncLiq.Color := clBtnFace;
+    FVentanaSyncLiq.OnCloseQuery := VentanaSyncLiqCloseQuery;
+
+    FSpinnerSyncLiq := TPaintBox.Create(FVentanaSyncLiq);
+    FSpinnerSyncLiq.Parent := FVentanaSyncLiq;
+    FSpinnerSyncLiq.SetBounds(28, 34, 52, 52);
+    FSpinnerSyncLiq.OnPaint := SpinnerSyncLiqPaint;
+
+    Lbl := TLabel.Create(FVentanaSyncLiq);
+    Lbl.Parent := FVentanaSyncLiq;
+    Lbl.AutoSize := False;
+    Lbl.SetBounds(96, 34, 260, 52);
+    Lbl.WordWrap := True;
+    Lbl.Alignment := taLeftJustify;
+    Lbl.Layout := tlCenter;
+    Lbl.Caption := 'Sincronizando informacion con liquidaciones nube';
+
+    FTimerSyncLiq := TTimer.Create(FVentanaSyncLiq);
+    FTimerSyncLiq.Enabled := False;
+    FTimerSyncLiq.Interval := 90;
+    FTimerSyncLiq.OnTimer := TimerSyncLiqTimer;
+  end;
+
+  if not FVentanaSyncLiq.Visible then begin
+    FVentanaSyncLiq.Left := Self.Left + ((Self.Width - FVentanaSyncLiq.Width) div 2);
+    FVentanaSyncLiq.Top := Self.Top + ((Self.Height - FVentanaSyncLiq.Height) div 2);
+
+    if FVentanaSyncLiq.Left < 0 then
+      FVentanaSyncLiq.Left := (Screen.Width - FVentanaSyncLiq.Width) div 2;
+    if FVentanaSyncLiq.Top < 0 then
+      FVentanaSyncLiq.Top := (Screen.Height - FVentanaSyncLiq.Height) div 2;
+
+    if not FFormDeshabilitadoPorSync then begin
+      FFormEnabledAntesSync := Self.Enabled;
+      Self.Enabled := False;
+      FFormDeshabilitadoPorSync := True;
+    end;
+
+    FVentanaSyncLiq.Show;
+  end;
+
+  if Assigned(FTimerSyncLiq) then
+    FTimerSyncLiq.Enabled := True;
+
+  FVentanaSyncLiq.BringToFront;
+  FVentanaSyncLiq.Update;
+
+  if Assigned(FSpinnerSyncLiq) then begin
+    FSpinnerSyncLiq.Invalidate;
+    FSpinnerSyncLiq.Update;
+  end;
+end;
+
+procedure TFLIQTURC.OcultaVentanaSincronizacionLiq;
+begin
+  if Assigned(FTimerSyncLiq) then
+    FTimerSyncLiq.Enabled := False;
+
+  if Assigned(FVentanaSyncLiq) and FVentanaSyncLiq.Visible then
+    FVentanaSyncLiq.Hide;
+
+  if FFormDeshabilitadoPorSync then begin
+    Self.Enabled := FFormEnabledAntesSync;
+    FFormDeshabilitadoPorSync := False;
+    if Self.Enabled and Self.Visible then
+      Self.BringToFront;
+  end;
+end;
+
+procedure TFLIQTURC.TimerSyncLiqTimer(Sender: TObject);
+begin
+  Inc(FPasoSyncLiq);
+  if FPasoSyncLiq > 11 then
+    FPasoSyncLiq := 0;
+
+  if Assigned(FSpinnerSyncLiq) then
+    FSpinnerSyncLiq.Invalidate;
+end;
+
+procedure TFLIQTURC.SpinnerSyncLiqPaint(Sender: TObject);
+var
+  I: Integer;
+  Paso: Integer;
+  Gris: Integer;
+  Radio: Integer;
+  Punto: Integer;
+  CentroX: Integer;
+  CentroY: Integer;
+  X: Integer;
+  Y: Integer;
+  Angulo: Double;
+begin
+  if not Assigned(FSpinnerSyncLiq) then
+    Exit;
+
+  with FSpinnerSyncLiq.Canvas do begin
+    Brush.Color := clBtnFace;
+    Pen.Style := psClear;
+    FillRect(FSpinnerSyncLiq.ClientRect);
+
+    CentroX := FSpinnerSyncLiq.Width div 2;
+    CentroY := FSpinnerSyncLiq.Height div 2;
+    Radio := 18;
+
+    for I := 0 to 11 do begin
+      Paso := (I - FPasoSyncLiq + 12) mod 12;
+      Gris := 80 + ((11 - Paso) * 13);
+      if Gris > 235 then
+        Gris := 235;
+      if Gris < 80 then
+        Gris := 80;
+
+      Punto := 4 + ((11 - Paso) div 5);
+      Angulo := (I * 2 * Pi / 12) - (Pi / 2);
+      X := CentroX + Round(Cos(Angulo) * Radio);
+      Y := CentroY + Round(Sin(Angulo) * Radio);
+
+      Brush.Color := TColor(RGB(Gris, Gris, Gris));
+      Ellipse(X - Punto, Y - Punto, X + Punto, Y + Punto);
+    end;
+  end;
+end;
+
+procedure TFLIQTURC.VentanaSyncLiqCloseQuery(Sender: TObject; var CanClose: Boolean);
+begin
+  CanClose := not HaySincronizacionLiquidacionAPIEnProceso;
+  if not CanClose and Assigned(FVentanaSyncLiq) then
+    FVentanaSyncLiq.BringToFront;
 end;
 
 procedure TFLIQTURC.PreparaForma(xModo:integer);
@@ -1515,18 +1685,26 @@ end;
 
 procedure TFLIQTURC.FormClose(Sender: TObject; var Action: TCloseAction);
 begin
-  // Descarta turnos pendientes. Si hay una consulta en vuelo, se desvincula
-  // para que al terminar no toque este formulario. No se usa WaitFor para no
-  // congelar la aplicacion ni provocar deadlocks con Synchronize.
+  // Si la sincronizacion con liquidaciones nube sigue en proceso, no se permite
+  // cerrar la ventana. De esta forma no se pierden turnos pendientes ni se tira
+  // a la basura el resultado de una consulta HTTP en vuelo.
+  if HaySincronizacionLiquidacionAPIEnProceso then begin
+    MuestraVentanaSincronizacionLiq;
+    Action := caNone;
+    Exit;
+  end;
+
+  OcultaVentanaSincronizacionLiq;
   LimpiaColaConsultaLiquidacionAPI;
   FConsultaLiqActiva := False;
   FConsultaLiqActivaFechaTurno := 0;
   FConsultaLiqActivaNoTurno := 0;
   FConsultaLiqActivaEstacion := 0;
 
-  if Assigned(FHiloConsultaLiq) then begin
-    TLiqApiConsultaLiqThread(FHiloConsultaLiq).OlvidaFormulario;
-    FHiloConsultaLiq := nil;
+  if Assigned(FVentanaSyncLiq) then begin
+    FTimerSyncLiq := nil;
+    FSpinnerSyncLiq := nil;
+    FreeAndNil(FVentanaSyncLiq);
   end;
 
   QL_Turc.Close;
