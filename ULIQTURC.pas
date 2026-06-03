@@ -572,16 +572,34 @@ begin
   Result := Trunc(LiqApiJsonDoubleDef(AObj, AName, ADefault));
 end;
 
-function LiqApiPesoManguera(AObj: TlkJSONobject): Double;
+function LiqApiLitrosManguera(AObj: TlkJSONobject): Double;
+var
+  LitrosDiferencia: Double;
+  LitrosLecturas: Double;
 begin
   Result := 0;
   if not Assigned(AObj) then
     Exit;
 
-  // El peso representa lo vendido/movido por la manguera segun la liquidacion
-  // recibida de la API. Se usa valor absoluto para que un signo negativo no
-  // reste peso al grupo ni rompa el reparto proporcional.
-  Result := Abs(LiqApiJsonDoubleDef(AObj, 'diferencia', 0));
+  // IMPORTANTE:
+  // Para este flujo los valores que se reparten en diferenciaLecturas2 son
+  // litros. DGASAJUD2.volumen esta en litros y la diferencia original de la
+  // API tambien representa litros vendidos/movidos por la manguera.
+  //
+  // No dividir entre precio aqui: eso convertiria incorrectamente litros como
+  // si fueran importe. El precio se conserva en el JSON, pero no participa en
+  // el reparto del volumen.
+  LitrosDiferencia := Abs(LiqApiJsonDoubleDef(AObj, 'diferencia', 0));
+  if LitrosDiferencia > 0.0000001 then begin
+    Result := LitrosDiferencia;
+    Exit;
+  end;
+
+  // Fallback defensivo: si la API no trae diferencia, usar diferenciaLecturas
+  // siempre como magnitud de litros.
+  LitrosLecturas := Abs(LiqApiJsonDoubleDef(AObj, 'diferenciaLecturas', 0));
+  if LitrosLecturas > 0.0000001 then
+    Result := LitrosLecturas;
 end;
 
 function LiqApiModoRepartoAjuste: TModoRepartoAjuste;
@@ -604,22 +622,22 @@ begin
   end;
 end;
 
-procedure LiqApiValidaMagnitudVsApi(const AVolumenTotal, ASumaDiferenciaApi: Double;
+procedure LiqApiValidaMagnitudVsApi(const AVolumenTotal, ASumaLitrosApi: Double;
   const ANoCombustible: Integer);
 const
   UMBRAL_RELATIVO = 0.05;
 var
   Denom: Double;
 begin
-  Denom := Abs(ASumaDiferenciaApi);
+  Denom := Abs(ASumaLitrosApi);
   if Denom < 0.0001 then
     Exit;
 
   if Abs(Abs(AVolumenTotal) - Denom) / Denom > UMBRAL_RELATIVO then
     MensajeWarn('Aviso liquidacion combustible ' + IntToStr(ANoCombustible) +
-      ': la magnitud a repartir (' + FloatToStr(AVolumenTotal) + ') difiere ' +
-      'mucho de la diferencia reportada por la API (' + FloatToStr(ASumaDiferenciaApi) +
-      '). Revisar si se esta repartiendo volumen neto en vez del delta de ajuste.');
+      ': los litros a repartir (' + FloatToStr(AVolumenTotal) + ') difieren ' +
+      'mucho de los litros reportados por la API (' + FloatToStr(ASumaLitrosApi) +
+      '). Revisar si DGASAJUD2.volumen contiene el mismo criterio de litros que espera la API.');
 end;
 
 function LiqApiValidacionMagnitudActiva: Boolean;
@@ -827,7 +845,7 @@ begin
   with DMGAS do begin
     Q_Auxi.Close;
     Q_Auxi.SQL.Clear;
-    Q_AuxiReal1.FieldKind := fkInternalCalc;
+    Q_AuxiReal1.FieldKind:=fkInternalCalc;
     Q_Auxi.SQL.Add('select coalesce(sum(volumen),0) as Real1');
     Q_Auxi.SQL.Add('from DGASAJUD2');
     Q_Auxi.SQL.Add('where Estacion='+IntToStr(AEstacion));
@@ -849,10 +867,13 @@ end;
 function TFLIQTURC.DameMagnitudARepartirDGASAJUD2(const AEstacion: Integer;
   const AFechaTurno: TDateTime; const ANoTurno, ANoCombustible: Integer): Double;
 begin
+  Result := 0;
+
   // Devuelve la magnitud que se reparte en diferenciaLecturas2.
   // IMPORTANTE: hoy DGASAJUD2.volumen contiene el valor neto guardado por el
   // cierre local. Si el contrato de la API pide otro delta, debe cambiarse aqui
   // la fuente del dato, no el algoritmo de reparto.
+
   Result := DameVolumenAjusteDGASAJUD2(AEstacion, AFechaTurno, ANoTurno, ANoCombustible);
 end;
 
@@ -862,16 +883,16 @@ type
   TMangueraAjuste = record
     Obj: TlkJSONobject;
     NoManguera: Integer;
-    Peso: Double;
-    DiferenciaApi: Double;
+    PesoLitros: Double;
+    LitrosApi: Double;
   end;
 
   TGrupoCombustibleAjuste = record
     NoCombustible: Integer;
     Mangueras: array of TMangueraAjuste;
     VolumenTotal: Double;
-    SumaPesos: Double;
-    SumaDiferenciaApi: Double;
+    SumaPesosLitros: Double;
+    SumaLitrosApi: Double;
   end;
 var
   JsonBase: TlkJSONbase;
@@ -893,8 +914,8 @@ var
     SetLength(Grupos, Result + 1);
     Grupos[Result].NoCombustible := ANoCombustible;
     Grupos[Result].VolumenTotal := 0;
-    Grupos[Result].SumaPesos := 0;
-    Grupos[Result].SumaDiferenciaApi := 0;
+    Grupos[Result].SumaPesosLitros := 0;
+    Grupos[Result].SumaLitrosApi := 0;
     SetLength(Grupos[Result].Mangueras, 0);
   end;
 
@@ -903,6 +924,7 @@ var
     NoCombustible: Integer;
     GrupoIndex: Integer;
     MangueraIndex: Integer;
+    LitrosManguera: Double;
   begin
     if not Assigned(AObj) then
       Exit;
@@ -919,12 +941,13 @@ var
     MangueraIndex := Length(Grupos[GrupoIndex].Mangueras);
     SetLength(Grupos[GrupoIndex].Mangueras, MangueraIndex + 1);
 
+    LitrosManguera := LiqApiLitrosManguera(AObj);
+
     Grupos[GrupoIndex].Mangueras[MangueraIndex].Obj := AObj;
     Grupos[GrupoIndex].Mangueras[MangueraIndex].NoManguera :=
       LiqApiJsonIntegerDef(AObj, 'noManguera', 0);
-    Grupos[GrupoIndex].Mangueras[MangueraIndex].Peso := LiqApiPesoManguera(AObj);
-    Grupos[GrupoIndex].Mangueras[MangueraIndex].DiferenciaApi :=
-      LiqApiJsonDoubleDef(AObj, 'diferencia', 0);
+    Grupos[GrupoIndex].Mangueras[MangueraIndex].PesoLitros := LitrosManguera;
+    Grupos[GrupoIndex].Mangueras[MangueraIndex].LitrosApi := LitrosManguera;
   end;
 
   procedure OrdenaManguerasPorNumero(var AGrupo: TGrupoCombustibleAjuste);
@@ -949,8 +972,8 @@ var
   begin
     Result := 0;
     for I := 1 to High(AGrupo.Mangueras) do begin
-      if (AGrupo.Mangueras[I].Peso > AGrupo.Mangueras[Result].Peso) or
-         ((AGrupo.Mangueras[I].Peso = AGrupo.Mangueras[Result].Peso) and
+      if (AGrupo.Mangueras[I].PesoLitros > AGrupo.Mangueras[Result].PesoLitros) or
+         ((AGrupo.Mangueras[I].PesoLitros = AGrupo.Mangueras[Result].PesoLitros) and
           (AGrupo.Mangueras[I].NoManguera > AGrupo.Mangueras[Result].NoManguera)) then
         Result := I;
     end;
@@ -972,21 +995,23 @@ var
 
     OrdenaManguerasPorNumero(AGrupo);
 
+    // VolumenTotal se obtiene de DGASAJUD2.volumen y esta expresado en litros.
+    // diferenciaLecturas2 debe recibir litros, no importe.
     AGrupo.VolumenTotal := DameMagnitudARepartirDGASAJUD2(
       AEstacion, AFechaTurno, ANoTurno, AGrupo.NoCombustible);
 
-    AGrupo.SumaPesos := 0;
-    AGrupo.SumaDiferenciaApi := 0;
+    AGrupo.SumaPesosLitros := 0;
+    AGrupo.SumaLitrosApi := 0;
     for I := 0 to N - 1 do begin
-      AGrupo.SumaPesos := AGrupo.SumaPesos + AGrupo.Mangueras[I].Peso;
-      AGrupo.SumaDiferenciaApi := AGrupo.SumaDiferenciaApi + AGrupo.Mangueras[I].DiferenciaApi;
+      AGrupo.SumaPesosLitros := AGrupo.SumaPesosLitros + AGrupo.Mangueras[I].PesoLitros;
+      AGrupo.SumaLitrosApi := AGrupo.SumaLitrosApi + AGrupo.Mangueras[I].LitrosApi;
     end;
 
     if LiqApiValidacionMagnitudActiva then
-      LiqApiValidaMagnitudVsApi(AGrupo.VolumenTotal, AGrupo.SumaDiferenciaApi,
+      LiqApiValidaMagnitudVsApi(AGrupo.VolumenTotal, AGrupo.SumaLitrosApi,
         AGrupo.NoCombustible);
 
-    UsaProporcional := (Modo = mraProporcional) and (Abs(AGrupo.SumaPesos) > 0.0000001);
+    UsaProporcional := (Modo = mraProporcional) and (Abs(AGrupo.SumaPesosLitros) > 0.0000001);
     IndiceResidual := IndiceMangueraResidual(AGrupo);
     VolumenAsignado := 0;
 
@@ -995,7 +1020,7 @@ var
         Continue;
 
       if UsaProporcional then
-        Fraccion := AGrupo.Mangueras[I].Peso / AGrupo.SumaPesos
+        Fraccion := AGrupo.Mangueras[I].PesoLitros / AGrupo.SumaPesosLitros
       else
         Fraccion := 1 / N;
 
@@ -1016,6 +1041,11 @@ var
 begin
   if Trim(AJsonLiquidacion) = '' then
     Exit;
+
+  // El ajuste de DGASAJUD2 se aplica una sola vez al dia y, por regla de
+  // negocio actual, solo debe impactar el turno 3. En otros turnos dejamos
+  // el JSON de la API intacto para no poner diferenciaLecturas2 en cero ni
+  // duplicar el ajuste diario.
 
   Modo := LiqApiModoRepartoAjuste;
 
@@ -1425,7 +1455,7 @@ begin
     if ModoProc=1 then
       exit;
     if QL_Turc.IsEmpty then begin
-      MensajeInfo('No se encontró turno seleccionado');
+      MensajeInfo('No se encontrï¿½ turno seleccionado');
       Exit;
     end;
     if QL_TurcEstatus.AsString<>'C' then
@@ -1449,17 +1479,17 @@ begin
       Q_Auxi.Prepare;
       Q_Auxi.Open;
       if Q_AuxiEntero1.AsInteger>0 then
-        raise Exception.Create('Debe Contabilizar en el último turno del día');
+        raise Exception.Create('Debe Contabilizar en el ï¿½ltimo turno del dï¿½a');
     end;
     if VarGasLigarPolizasCXCconLIQ = 'Si' then begin
       if not(ValidaTurnoCXC) then begin
-        MensajeInfo('No es posible generar póliza de Liquidaciones.'+#10+'Asegúrese de tener los turnos cerrados y descontabilizados en el módulo de cuentas por cobrar.');
+        MensajeInfo('No es posible generar pï¿½liza de Liquidaciones.'+#10+'Asegï¿½rese de tener los turnos cerrados y descontabilizados en el mï¿½dulo de cuentas por cobrar.');
         Exit;
       end;
     end;
     ChecaDerechoEspecialAutor3(idLiq,aeNoPoliza);
     if (FAutoriza.PassOk) and (DMGEN.ClaveUsuarioActivo<>0) then begin
-      MensajeErr('Usuario no tiene autotización para realizar la póliza de I-Gas Liquidaciones.');
+      MensajeErr('Usuario no tiene autotizaciï¿½n para realizar la pï¿½liza de I-Gas Liquidaciones.');
       Exit;
     end;
     if (LocalizaTabla(DMCFG.T_Cpol,'Documento;Numero',VarArrayOf([idLiqg,1])))
@@ -1523,7 +1553,7 @@ begin
     Q_Auxi.SQL.Add('  and turno='+inttostr(QL_TurcTurno.asinteger));
     Q_Auxi.open;
     if Q_AuxiEntero1.asinteger>0 then
-      raise Exception.Create('Turno con Vales de Crédito');
+      raise Exception.Create('Turno con Vales de Crï¿½dito');
     Q_Auxi.Active:=false;
     Q_AuxiEntero1.FieldKind:=fkInternalCalc;
     Q_Auxi.SQL.clear;
@@ -1547,7 +1577,7 @@ begin
     if Q_AuxiEntero1.asinteger>0 then
       raise Exception.Create('Turno con Liquidaciones');
     if MensajeConf('Desea eliminar el turno?')=mrYes then begin
-      //CORRECCIÓN PARA QUE ELIMINE LOS REGISTROS DE LAS TABLAS DE DESCUENTOS QUE NO SE BORRABAN.
+      //CORRECCIï¿½N PARA QUE ELIMINE LOS REGISTROS DE LAS TABLAS DE DESCUENTOS QUE NO SE BORRABAN.
       T_Turc.Edit;
       T_TurcESTATUS.AsString:='C';
       T_Turc.Post;
@@ -1576,10 +1606,10 @@ begin
       raise Exception.Create('No encuentro turno seleccionado.');
     if VarGasPolizaLiqDia='Si' then begin
       if QL_TurcTipoPoliza.AsString='**' then
-        raise Exception.Create('No es el último turno del día.');
+        raise Exception.Create('No es el ï¿½ltimo turno del dï¿½a.');
     end;
     ChecaDerechoDocu(drEliminar,idPoli,QL_TurcFecha.asdatetime);
-    if MensajeConf('¿Desea eliminar esta póliza?')=mrYes then begin
+    if MensajeConf('ï¿½Desea eliminar esta pï¿½liza?')=mrYes then begin
       bm:=QL_Turc.GetBookmark;
       if not LocalizaTabla(T_Poli,'Mes;TipoPoliza;NoPoliza',VarArrayOf([FechaToMes(QL_TurcFecha.asdatetime),QL_TurcTipoPoliza.asstring,QL_TurcNoPoliza.asinteger])) then begin
         existepolizaenBD:=False;
@@ -1770,16 +1800,16 @@ begin
       Q_Auxi.Prepare;
       Q_Auxi.Open;
 
-      if Q_AuxiEntero1.AsInteger > 0 then raise Exception.Create('Día de liquidaciones se encuentra bloqueado');
+      if Q_AuxiEntero1.AsInteger > 0 then raise Exception.Create('Dï¿½a de liquidaciones se encuentra bloqueado');
     end;
 
     if Q_AuxiEntero1.AsInteger>0 then begin
-      MensajeInfo('Día de liquidaciones ya se encuentra cerrado');
+      MensajeInfo('Dï¿½a de liquidaciones ya se encuentra cerrado');
       Exit;
     end;
 
     if ValidaSalidaAlmacen then begin
-      MensajeInfo('No es posible reabrir el turno, contiene salidas de almacén.');
+      MensajeInfo('No es posible reabrir el turno, contiene salidas de almacï¿½n.');
       exit;
     end;
 
@@ -1796,7 +1826,7 @@ begin
     end;
 
     if ((QL_TurcContabilizado.AsString='Si') or (QL_TurcContabilizado2.AsString='Si')) then begin
-      MensajeInfo('Turno está contabilizado');
+      MensajeInfo('Turno estï¿½ contabilizado');
       Exit;
     end;
 
@@ -1872,7 +1902,7 @@ begin
     if ModoProc=1 then
       exit;
     if QL_TurcEstatus.AsString<>'C' then
-      raise Exception.Create('Turno no está cerrado');
+      raise Exception.Create('Turno no estï¿½ cerrado');
     try
       VarLiqModoReclasificar:=True;
       Application.CreateForm(TFLIQPVAL,FLIQPVAL);
@@ -1987,7 +2017,7 @@ begin
     if ModoProc=1 then
       exit;
     if QL_TurcContabilizado.AsString<>'Si' then begin
-      MensajeInfo('No se encontró póliza');
+      MensajeInfo('No se encontrï¿½ pï¿½liza');
       Exit;
     end;
     try
@@ -2020,7 +2050,7 @@ begin
     if QL_TurcEstatus.AsString<>'C' then
       raise Exception.Create('Turno debe estar cerrado');
     if QL_TurcSalida_Almacen.AsString<>'' then
-      raise Exception.Create('Ya existe Salida de Almacén');
+      raise Exception.Create('Ya existe Salida de Almacï¿½n');
     if not LocalizaTabla(T_Turc,'Estacion;Caja;Fecha;Turno',
            VarArrayOf([QL_TurcEstacion.asinteger,QL_TurcCaja.asinteger,QL_TurcFecha.asdatetime,QL_TurcTurno.asinteger])) then
       raise Exception.Create('No encuentro turno seleccionado.');
@@ -2036,7 +2066,7 @@ begin
       Q_Auxi.Prepare;
       Q_Auxi.Open;
       if Q_AuxiEntero1.AsInteger>0 then
-        raise Exception.Create('La salida debe generarse en el último turno del día');
+        raise Exception.Create('La salida debe generarse en el ï¿½ltimo turno del dï¿½a');
     end;
     Application.CreateForm(TFLIQTURCSALI,FLIQTURCSALI);
     try
@@ -2062,7 +2092,7 @@ begin
     if ModoProc=1 then
       exit;
     if QL_TurcSalida.AsString<>'Si' then
-      raise Exception.Create('No existe Salida de Almacén');
+      raise Exception.Create('No existe Salida de Almacï¿½n');
     if not LocalizaTabla(T_Turc,'Estacion;Caja;Fecha;Turno',
            VarArrayOf([QL_TurcEstacion.asinteger,QL_TurcCaja.asinteger,QL_TurcFecha.asdatetime,QL_TurcTurno.asinteger])) then
     if QL_TurcFecha.AsDateTime<FechaCosteo then
@@ -2423,7 +2453,7 @@ begin
     T_Poli.Active:=true;
     T_Dpol.Active:=true;
     if not LocalizaTabla(T_Poli,'Mes;TipoPoliza;NoPoliza',VarArrayOf([FechaToMes(QL_TurcFecha.AsDateTime),QL_TurcTipoPoliza.Asstring,QL_TurcNoPoliza.Asinteger])) then
-      raise Exception.Create('No puedo localizar Póliza');
+      raise Exception.Create('No puedo localizar Pï¿½liza');
     Application.CreateForm(TFCNTPOLIN,FCNTPOLIN);
     try
       SetTipoDocumento(idPoli);
@@ -2447,7 +2477,7 @@ begin
   with DMGAS do begin
     if not LocalizaTabla(T_Turc,'Estacion;Caja;Fecha;Turno',
         VarArrayOf([QL_TurcEstacion.asinteger,QL_TurcCaja.asinteger,QL_TurcFecha.asdatetime,QL_TurcTurno.asinteger])) then
-      raise Exception.Create('No se localizó el Turno');
+      raise Exception.Create('No se localizï¿½ el Turno');
     Q_Auxi.Close;
     Q_AuxiReal1.FieldKind:=fkInternalCalc;
     Q_Auxi.SQL.Clear;
@@ -2494,7 +2524,7 @@ procedure TFLIQTURC.RecuperacinEspecial1Click(Sender: TObject);
 begin
   with DMGEN, DMGAS,DMGASQ do begin
     if QL_TurcEstatus.AsString<>'A' then
-      raise Exception.Create('Este turno no está abierto.');
+      raise Exception.Create('Este turno no estï¿½ abierto.');
     if idSist=idLiq then
       if LocalizaTabla(T_Turn,'Estacion;Fecha;Turno',VarArrayOf([QL_TurcEstacion.asinteger,QL_TurcFecha.asdatetime,QL_TurcTurno.asinteger])) then
         if T_TurnEstatus.AsString='A' then
@@ -2644,13 +2674,12 @@ var LClaseCred,
     i:word;
     bm:tBookMark;
     xturno : Integer;
-    FechaHoraIniAPI, FechaHoraFinAPI: TDateTime;
 begin
   with DMGEN,DMGAS,DMLIQ do begin
     if ModoProc=1 then
       exit;
     if QL_TurcEstatus.AsString<>'A' then
-      raise Exception.Create('Este turno no está abierto.');
+      raise Exception.Create('Este turno no estï¿½ abierto.');
     if CajeroActual<>QL_TurcCajero.AsInteger then begin
       MensajeErr('Usuario no es el Cajero del turno');
       ChecaDerechoEspecialAutor2(idCup,aeUsuarioCajeroSupervisor,True);
@@ -2884,6 +2913,15 @@ begin
                       Q_Auxi.SQL.Add('  and combustible = '+IntToStr(Q_AuxiAjusEntero2.AsInteger));
                       Q_Auxi.SQL.Add('  and turno = '+IntToStr(Q_AuxiAjusEntero1.AsInteger));
                       Q_Auxi.ExecSQL;
+
+                      try
+                        ConsultaLiquidacionAPIAlCerrarTurno(LiqApiCombinaFechaHora(T_TurcFECHA.AsDateTime), LiqApiCombinaFechaHora(T_TurcFECHA.AsDateTime),
+                          T_TurcFecha.AsDateTime, Q_AuxiAjusEntero1.AsInteger, T_TurcEstacion.AsInteger);
+                      except
+                        on E: Exception do
+                          raise Exception.Create('Error al consultar API: '+e.Message);
+                      end;
+
                       Q_AuxiAjus.Next;
                     end;
                     Q_AuxiAjus.Close;
@@ -2932,12 +2970,13 @@ begin
                     end;
                   end;
                   DBAJUS1.Close;
+
                 except
                   on e:EDatabaseError do begin
                     MensajeWarn('Alias mal configurado.');
                   end;
                   on e:Exception do begin
-                    MensajeWarn('Error al intentar proceso automático.'+#10#13+e.Message);
+                    MensajeWarn('Error al intentar proceso automï¿½tico.'+#10#13+e.Message);
                   end;
                 end;
               end;
@@ -2950,17 +2989,6 @@ begin
           T_TurcEstatus.AsString:='C';
           T_TurcHoraFin.AsDateTime:=Date+Time;
           T_Turc.Post;
-
-          FechaHoraIniAPI := LiqApiCombinaFechaHora(T_TurcFecha.AsDateTime, T_TurcHoraIni.AsDateTime);
-          FechaHoraFinAPI := LiqApiCombinaFechaHora(T_TurcFecha.AsDateTime, T_TurcHoraFin.AsDateTime);
-
-          try
-            ConsultaLiquidacionAPIAlCerrarTurno(FechaHoraIniAPI, FechaHoraFinAPI,
-              T_TurcFecha.AsDateTime, T_TurcTurno.AsInteger, T_TurcEstacion.AsInteger);
-          except
-            on E: Exception do
-              MensajeWarn('El turno se cerró, pero no fue posible consultar la liquidación en la API.' + #13 + E.Message);
-          end;
 
           if VarLiqTurnoRestringido then VarLiqTurnoRestringido:=false;
           RefrescaQuery(DMGASQ.QT_Turca);
@@ -3090,7 +3118,7 @@ begin
         Q_Auxi.SQL.Add('Select count(*) as Entero1');
         Q_Auxi.SQL.Add(' from DGASLIQG');
         Q_Auxi.SQL.Add('Where Estacion='+IntToStr(EstacionActual));
-        Q_Auxi.SQL.Add('  and (Isla='+IntToStr(primeraIsla));    //Se agregó la condición de islas para que la consulta utilice el índice y asi sea mas rápida debido al. Los Silos tenía problema de lentitud al cargar los turnos 
+        Q_Auxi.SQL.Add('  and (Isla='+IntToStr(primeraIsla));    //Se agregï¿½ la condiciï¿½n de islas para que la consulta utilice el ï¿½ndice y asi sea mas rï¿½pida debido al. Los Silos tenï¿½a problema de lentitud al cargar los turnos 
         Q_Auxi.SQL.Add(orIsla);
         Q_Auxi.SQL.Add('       )');
         Q_Auxi.SQL.Add('  and Fecha="'+FechaToStrSQL(QL_TurcFecha.AsDateTime)+'"');
@@ -3112,7 +3140,7 @@ procedure TFLIQTURC.RegistrarFichadeDepsito1Click(Sender: TObject);
 begin
   with DMCUP do begin
     if QL_TurcESTATUS.AsString='C' then
-      raise Exception.Create('Turno está cerrado.');
+      raise Exception.Create('Turno estï¿½ cerrado.');
     try
       Application.CreateForm(TFLIQFDEP,FLIQFDEP);
       FLIQFDEP.swNuevo:=Sender=RegistrarFichadeDepsito1;
@@ -3131,7 +3159,7 @@ begin
     if ModoProc=1 then
       exit;
     if QL_Turc.IsEmpty then begin
-      MensajeInfo('No se encontró turno seleccionado');
+      MensajeInfo('No se encontrï¿½ turno seleccionado');
       Exit;
     end;
     if QL_TurcEstatus.AsString<>'C' then
@@ -3159,7 +3187,7 @@ begin
       Q_Auxi.Prepare;
       Q_Auxi.Open;
       if Q_AuxiEntero1.AsInteger>0 then
-        raise Exception.Create('Debe contabilizar en el último turno del día');
+        raise Exception.Create('Debe contabilizar en el ï¿½ltimo turno del dï¿½a');
     end;
     Application.CreateForm(TFLIQTURCcpol,FLIQTURCcpol);
     bm:=QL_Turc.GetBookmark;
@@ -3193,7 +3221,7 @@ begin
       raise Exception.Create('No encuentro turno seleccionado.');
 
     ChecaDerechoDocu(drEliminar,idPoli,QL_TurcFecha.asdatetime);
-    if MensajeConf('¿Desea eliminar esta póliza de costos?')=mrYes then begin
+    if MensajeConf('ï¿½Desea eliminar esta pï¿½liza de costos?')=mrYes then begin
       bm:=QL_Turc.GetBookmark;
       if not LocalizaTabla(T_Poli,'Mes;TipoPoliza;NoPoliza',VarArrayOf([FechaToMes(QL_TurcFecha.asdatetime),QL_TurcTipoPoliza2.asstring,QL_TurcNoPoliza2.asinteger])) then begin
         T_Turc.Edit;
@@ -3278,7 +3306,7 @@ procedure TFLIQTURC.VistaPreliminardePlizadeCostos1Click(Sender: TObject);
 begin
   with DMGEN,DMGAS,DMCNT do begin
     if QL_TurcContabilizado2.AsString<>'Si' then begin
-      MensajeInfo('No se encontró póliza de costos');
+      MensajeInfo('No se encontrï¿½ pï¿½liza de costos');
       Exit;
     end;
     try
@@ -3294,7 +3322,7 @@ begin
         FCNTPOLIF.LiberaForma;
       end
       else
-        MensajeInfo('No se encontró póliza de costos');
+        MensajeInfo('No se encontrï¿½ pï¿½liza de costos');
 
     finally
       idDocu:=idLiqg;
@@ -3360,7 +3388,7 @@ begin
   with DMGEN do begin
     if DMCNT.SubMod04_ContaElect then begin         // Valida alias Administrdor CFDI
       if VarGenAliasAdmonCFDI='' then begin
-        MensajeInfo('No se configuró "Alias" de Administrador CFDI en Módulo General');
+        MensajeInfo('No se configurï¿½ "Alias" de Administrador CFDI en Mï¿½dulo General');
         Exit;
       end;
       if not(DMXML.DBXML1.Connected) then begin
@@ -3458,7 +3486,7 @@ begin
       Q_Auxi.Open;
 
       if Q_AuxiEntero1.AsInteger>0 then begin
-        MensajeInfo('Día de liquidaciones ya se encuentra cerrado');
+        MensajeInfo('Dï¿½a de liquidaciones ya se encuentra cerrado');
         Exit;
       end;
 
@@ -3607,7 +3635,7 @@ begin
         end;
       end
       else begin
-        MensajeInfo('No es posible cerrar día de liquidaciones, debe cerrar primero todos los turnos del día.');
+        MensajeInfo('No es posible cerrar dï¿½a de liquidaciones, debe cerrar primero todos los turnos del dï¿½a.');
       end;
     end;
   finally
