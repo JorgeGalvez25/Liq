@@ -52,6 +52,7 @@ type
     ToolButton6: TToolButton;
     ToolButton7: TToolButton;
     TBAjusta: TToolButton;
+    ToolButton8: TToolButton;
     TL_Ajud2TURNO: TIntegerField;
     procedure ToolButton1Click(Sender: TObject);
     procedure TL_AjudFECHAValidate(Sender: TField);
@@ -70,6 +71,7 @@ type
     procedure ToolButton3Click(Sender: TObject);
     procedure ToolButton7Click(Sender: TObject);
     procedure ToolButton6Click(Sender: TObject);
+    procedure ToolButton8Click(Sender: TObject);
     procedure TBAjustaClick(Sender: TObject);
     procedure FormShow(Sender: TObject);
     procedure TL_AjudFECHAChange(Sender: TField);
@@ -104,6 +106,9 @@ type
     procedure IniciaSiguienteConsultaLiquidacionAPI;
     procedure FinalizaConsultaLiquidacionAPI(AThread: TThread);
     procedure LimpiaColaConsultaLiquidacionAPI;
+    function EjecutaAjusteLiquidacionAPIDia(const AFechaTurno: TDateTime;
+      const AEstacion: Integer; const AGuardarConFecha: Boolean;
+      var AMensajeError: string): Boolean;
   public
     { Public declarations }
     destructor Destroy; override;
@@ -154,6 +159,24 @@ type
     procedure TimerTick(Sender: TObject);
   public
     constructor Create(AOwner: TComponent); override;
+  end;
+
+  TSyncRangoAjudForm = class(TForm)
+  private
+    FFormLiq: TFLIQAJUD;
+    FFechaIni: TDateTimePicker;
+    FFechaFin: TDateTimePicker;
+    FProgress: TProgressBar;
+    FLabelEstado: TLabel;
+    FBtnSincronizar: TButton;
+    FBtnCancelar: TButton;
+    FEjecutando: Boolean;
+    FCancela: Boolean;
+    procedure SincronizarClick(Sender: TObject);
+    procedure CancelarClick(Sender: TObject);
+    procedure FormCloseQuery(Sender: TObject; var CanClose: Boolean);
+  public
+    constructor Create(AOwner: TComponent; AFormLiq: TFLIQAJUD); reintroduce;
   end;
 
 var
@@ -273,6 +296,201 @@ begin
       Brush.Color := DotColor;
       Ellipse(X - RadioPunto, Y - RadioPunto, X + RadioPunto + 1, Y + RadioPunto + 1);
     end;
+  end;
+
+end;
+
+constructor TSyncRangoAjudForm.Create(AOwner: TComponent; AFormLiq: TFLIQAJUD);
+var
+  Lbl: TLabel;
+  FechaBase: TDateTime;
+begin
+  inherited CreateNew(AOwner);
+  FFormLiq := AFormLiq;
+  FEjecutando := False;
+  FCancela := False;
+
+  BorderStyle := bsDialog;
+  BorderIcons := [biSystemMenu];
+  Caption := 'Sincronizar liquidaciones';
+  ClientWidth := 400;
+  ClientHeight := 178;
+  Position := poOwnerFormCenter;
+  Font.Name := 'MS Sans Serif';
+  Font.Size := 8;
+  OnCloseQuery := FormCloseQuery;
+
+  FechaBase := Date;
+  if Assigned(FFormLiq) and Assigned(FFormLiq.TL_Ajud) and
+     FFormLiq.TL_Ajud.Active and (not FFormLiq.TL_Ajud.IsEmpty) then
+    FechaBase := FFormLiq.TL_AjudFECHA.AsDateTime;
+
+  Lbl := TLabel.Create(Self);
+  Lbl.Parent := Self;
+  Lbl.Left := 20;
+  Lbl.Top := 20;
+  Lbl.Caption := 'Fecha inicial';
+
+  FFechaIni := TDateTimePicker.Create(Self);
+  FFechaIni.Parent := Self;
+  FFechaIni.Left := 110;
+  FFechaIni.Top := 16;
+  FFechaIni.Width := 110;
+  FFechaIni.Date := FechaBase;
+
+  Lbl := TLabel.Create(Self);
+  Lbl.Parent := Self;
+  Lbl.Left := 20;
+  Lbl.Top := 52;
+  Lbl.Caption := 'Fecha final';
+
+  FFechaFin := TDateTimePicker.Create(Self);
+  FFechaFin.Parent := Self;
+  FFechaFin.Left := 110;
+  FFechaFin.Top := 48;
+  FFechaFin.Width := 110;
+  FFechaFin.Date := FechaBase;
+
+  FLabelEstado := TLabel.Create(Self);
+  FLabelEstado.Parent := Self;
+  FLabelEstado.Left := 20;
+  FLabelEstado.Top := 86;
+  FLabelEstado.Width := 360;
+  FLabelEstado.AutoSize := False;
+  FLabelEstado.Caption := 'Seleccione el rango de fechas a sincronizar.';
+
+  FProgress := TProgressBar.Create(Self);
+  FProgress.Parent := Self;
+  FProgress.Left := 20;
+  FProgress.Top := 108;
+  FProgress.Width := 360;
+  FProgress.Height := 18;
+  FProgress.Min := 0;
+  FProgress.Max := 100;
+  FProgress.Position := 0;
+
+  FBtnSincronizar := TButton.Create(Self);
+  FBtnSincronizar.Parent := Self;
+  FBtnSincronizar.Left := 205;
+  FBtnSincronizar.Top := 142;
+  FBtnSincronizar.Width := 85;
+  FBtnSincronizar.Caption := 'Sincronizar';
+  FBtnSincronizar.OnClick := SincronizarClick;
+
+  FBtnCancelar := TButton.Create(Self);
+  FBtnCancelar.Parent := Self;
+  FBtnCancelar.Left := 295;
+  FBtnCancelar.Top := 142;
+  FBtnCancelar.Width := 85;
+  FBtnCancelar.Caption := 'Cerrar';
+  FBtnCancelar.OnClick := CancelarClick;
+end;
+
+procedure TSyncRangoAjudForm.FormCloseQuery(Sender: TObject; var CanClose: Boolean);
+begin
+  CanClose := not FEjecutando;
+  if not CanClose then
+    FCancela := True;
+end;
+
+procedure TSyncRangoAjudForm.CancelarClick(Sender: TObject);
+begin
+  if FEjecutando then
+    FCancela := True
+  else
+    Close;
+end;
+
+procedure TSyncRangoAjudForm.SincronizarClick(Sender: TObject);
+var
+  FechaIni: TDateTime;
+  FechaFin: TDateTime;
+  FechaAct: TDateTime;
+  TotalDias: Integer;
+  DiaActual: Integer;
+  Errores: Integer;
+  MensajeError: string;
+  ResumenErrores: string;
+  Estacion: Integer;
+begin
+  if FEjecutando then
+    Exit;
+
+  FechaIni := Trunc(FFechaIni.Date);
+  FechaFin := Trunc(FFechaFin.Date);
+
+  if FechaIni > FechaFin then begin
+    MensajeWarn('La fecha inicial no puede ser mayor que la fecha final.');
+    Exit;
+  end;
+
+  if Assigned(FFormLiq) and FFormLiq.HayConsultasLiquidacionPendientesOActivas then begin
+    MensajeWarn('Hay una sincronizacion de liquidaciones en proceso. Espere a que termine para iniciar el rango.');
+    Exit;
+  end;
+
+  if MensajeConf('Desea sincronizar liquidaciones del '+FechaPaq(FechaIni)+
+    ' al '+FechaPaq(FechaFin)+'?')<>mrYes then
+    Exit;
+
+  FEjecutando := True;
+  FCancela := False;
+  FBtnSincronizar.Enabled := False;
+  FBtnCancelar.Caption := 'Cancelar';
+  FFechaIni.Enabled := False;
+  FFechaFin.Enabled := False;
+
+  TotalDias := Trunc(FechaFin - FechaIni) + 1;
+  FProgress.Min := 0;
+  FProgress.Max := TotalDias;
+  FProgress.Position := 0;
+
+  DiaActual := 0;
+  Errores := 0;
+  ResumenErrores := '';
+  FechaAct := FechaIni;
+  Estacion := DMGAS.EstacionActual;
+
+  try
+    while FechaAct <= FechaFin do begin
+      if FCancela then
+        Break;
+
+      FLabelEstado.Caption := 'Sincronizando '+FechaPaq(FechaAct)+'...';
+      Update;
+      Application.ProcessMessages;
+
+      MensajeError := '';
+      if (not Assigned(FFormLiq)) or
+         (not FFormLiq.EjecutaAjusteLiquidacionAPIDia(FechaAct, Estacion, True, MensajeError)) then begin
+        Inc(Errores);
+        if ResumenErrores <> '' then
+          ResumenErrores := ResumenErrores + #13;
+        ResumenErrores := ResumenErrores + FechaPaq(FechaAct) + ': ' + MensajeError;
+      end;
+
+      Inc(DiaActual);
+      FProgress.Position := DiaActual;
+      FLabelEstado.Caption := 'Procesadas '+IntToStr(DiaActual)+' de '+IntToStr(TotalDias)+' fechas.';
+      Update;
+      Application.ProcessMessages;
+
+      FechaAct := FechaAct + 1;
+    end;
+
+    if FCancela then
+      MensajeWarn('Sincronizacion cancelada. Se procesaron '+IntToStr(DiaActual)+' de '+IntToStr(TotalDias)+' fechas.')
+    else if Errores > 0 then
+      MensajeWarn('Sincronizacion terminada con '+IntToStr(Errores)+' error(es).' + #13 + ResumenErrores)
+    else
+      MensajeInfo('Sincronizacion terminada correctamente.');
+  finally
+    FEjecutando := False;
+    FBtnSincronizar.Enabled := True;
+    FBtnCancelar.Caption := 'Cerrar';
+    FFechaIni.Enabled := True;
+    FFechaFin.Enabled := True;
+    FLabelEstado.Caption := 'Proceso terminado.';
   end;
 end;
 
@@ -1158,6 +1376,52 @@ begin
   end;
 end;
 
+function TFLIQAJUD.EjecutaAjusteLiquidacionAPIDia(const AFechaTurno: TDateTime;
+  const AEstacion: Integer; const AGuardarConFecha: Boolean;
+  var AMensajeError: string): Boolean;
+var
+  AccessToken: string;
+  TokenType: string;
+  JsonLiquidacion: string;
+  NombreArchivo: string;
+  JsonStr: TStringList;
+begin
+  Result := False;
+  AMensajeError := '';
+
+  try
+    if not LiqApiObtenerToken(AccessToken, TokenType) then
+      raise Exception.Create('No fue posible obtener el token de la API.');
+
+    LiqApiConsultarLiquidacion(AccessToken, TokenType,
+      AFechaTurno, AFechaTurno, 0, JsonLiquidacion);
+
+    AplicarAjusteDGASAJUD2Json(JsonLiquidacion, AEstacion, AFechaTurno, 0);
+    FJsonLiquidacionAPI := JsonLiquidacion;
+
+    ForceDirectories('C:\ImagenCo');
+    if AGuardarConFecha then
+      NombreArchivo := 'C:\ImagenCo\JsonLiq_Ajud_Dia_' + FormatDateTime('yyyymmdd', AFechaTurno) + '.txt'
+    else
+      NombreArchivo := 'C:\ImagenCo\JsonLiq_Ajud_Dia.txt';
+
+    JsonStr := TStringList.Create;
+    try
+      JsonStr.Add(JsonLiquidacion);
+      JsonStr.SaveToFile(NombreArchivo);
+    finally
+      JsonStr.Free;
+    end;
+
+    Result := True;
+  except
+    on E: Exception do begin
+      AMensajeError := E.Message;
+      Result := False;
+    end;
+  end;
+end;
+
 procedure TFLIQAJUD.ConsultaLiquidacionAPIAlCerrarTurno(const AFechaIni, AFechaFin, AFechaTurno: TDateTime;
   const ANoTurno, AEstacion: Integer);
 begin
@@ -1586,6 +1850,23 @@ begin
           MensajeWarn('La fecha se bloqueo, pero no fue posible programar la consulta diaria en la API.' + #13 + E.Message);
       end;
     end;
+  end;
+end;
+
+procedure TFLIQAJUD.ToolButton8Click(Sender: TObject);
+var
+  FormaRango: TSyncRangoAjudForm;
+begin
+  if HayConsultasLiquidacionPendientesOActivas then begin
+    MensajeWarn('Hay una sincronizacion de liquidaciones en proceso. Espere a que termine para iniciar el rango.');
+    Exit;
+  end;
+
+  FormaRango := TSyncRangoAjudForm.Create(Application, Self);
+  try
+    FormaRango.ShowModal;
+  finally
+    FormaRango.Free;
   end;
 end;
 

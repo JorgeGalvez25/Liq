@@ -67,7 +67,7 @@ object FLIQAJUD: TFLIQAJUD
     object ToolBar1: TToolBar
       Left = 0
       Top = 0
-      Width = 225
+      Width = 266
       Height = 35
       Align = alNone
       ButtonHeight = 31
@@ -138,8 +138,16 @@ object FLIQAJUD: TFLIQAJUD
         ImageIndex = 21
         OnClick = ToolButton7Click
       end
-      object TBAjusta: TToolButton
+      object ToolButton8: TToolButton
         Left = 181
+        Top = 2
+        Hint = 'Sincronizar liquidaciones'
+        Caption = 'ToolButton8'
+        ImageIndex = 16
+        OnClick = ToolButton8Click
+      end
+      object TBAjusta: TToolButton
+        Left = 214
         Top = 2
         Caption = 'TBAjusta'
         ImageIndex = 22
