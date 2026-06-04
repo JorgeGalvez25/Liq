@@ -166,7 +166,8 @@ type
     FFormLiq: TFLIQAJUD;
     FFechaIni: TDateTimePicker;
     FFechaFin: TDateTimePicker;
-    FProgress: TProgressBar;
+    FProgressBox: TPaintBox;
+    FProgressPercent: Integer;
     FLabelEstado: TLabel;
     FBtnSincronizar: TButton;
     FBtnCancelar: TButton;
@@ -175,6 +176,8 @@ type
     procedure SincronizarClick(Sender: TObject);
     procedure CancelarClick(Sender: TObject);
     procedure FormCloseQuery(Sender: TObject; var CanClose: Boolean);
+    procedure PaintProgress(Sender: TObject);
+    procedure DibujaProgreso;
   public
     constructor Create(AOwner: TComponent; AFormLiq: TFLIQAJUD); reintroduce;
   end;
@@ -359,15 +362,15 @@ begin
   FLabelEstado.AutoSize := False;
   FLabelEstado.Caption := 'Seleccione el rango de fechas a sincronizar.';
 
-  FProgress := TProgressBar.Create(Self);
-  FProgress.Parent := Self;
-  FProgress.Left := 20;
-  FProgress.Top := 108;
-  FProgress.Width := 360;
-  FProgress.Height := 18;
-  FProgress.Min := 0;
-  FProgress.Max := 100;
-  FProgress.Position := 0;
+  FProgressBox := TPaintBox.Create(Self);
+  FProgressBox.Parent := Self;
+  FProgressBox.Left := 20;
+  FProgressBox.Top := 108;
+  FProgressBox.Width := 360;
+  FProgressBox.Height := 18;
+  FProgressBox.OnPaint := PaintProgress;
+
+  FProgressPercent := 0;
 
   FBtnSincronizar := TButton.Create(Self);
   FBtnSincronizar.Parent := Self;
@@ -384,6 +387,47 @@ begin
   FBtnCancelar.Width := 85;
   FBtnCancelar.Caption := 'Cerrar';
   FBtnCancelar.OnClick := CancelarClick;
+end;
+
+procedure TSyncRangoAjudForm.PaintProgress(Sender: TObject);
+begin
+  DibujaProgreso;
+end;
+
+procedure TSyncRangoAjudForm.DibujaProgreso;
+const
+  COLOR_AZUL = $00D77800;
+var
+  R: TRect;
+  RF: TRect;
+  AnchoDisponible: Integer;
+  AnchoFill: Integer;
+begin
+  if not Assigned(FProgressBox) then
+    Exit;
+
+  R := Rect(0, 0, FProgressBox.Width, FProgressBox.Height);
+
+  FProgressBox.Canvas.Brush.Color := clWhite;
+  FProgressBox.Canvas.Pen.Color := clGray;
+  FProgressBox.Canvas.Rectangle(R.Left, R.Top, R.Right, R.Bottom);
+
+  InflateRect(R, -2, -2);
+  FProgressBox.Canvas.Brush.Color := clWhite;
+  FProgressBox.Canvas.FillRect(R);
+
+  AnchoDisponible := R.Right - R.Left;
+  AnchoFill := MulDiv(AnchoDisponible, FProgressPercent, 100);
+
+  if FProgressPercent >= 100 then
+    AnchoFill := AnchoDisponible;
+
+  if AnchoFill > 0 then begin
+    RF := Rect(R.Left, R.Top, R.Left + AnchoFill, R.Bottom);
+    FProgressBox.Canvas.Brush.Color := COLOR_AZUL;
+    FProgressBox.Canvas.Pen.Color := COLOR_AZUL;
+    FProgressBox.Canvas.Rectangle(RF.Left, RF.Top, RF.Right, RF.Bottom);
+  end;
 end;
 
 procedure TSyncRangoAjudForm.FormCloseQuery(Sender: TObject; var CanClose: Boolean);
@@ -408,10 +452,26 @@ var
   FechaAct: TDateTime;
   TotalDias: Integer;
   DiaActual: Integer;
+  Porcentaje: Integer;
   Errores: Integer;
   MensajeError: string;
   ResumenErrores: string;
   Estacion: Integer;
+
+  procedure ActualizaBarraProgreso(AValor: Integer);
+  begin
+    if AValor < 0 then
+      AValor := 0;
+    if AValor > 100 then
+      AValor := 100;
+
+    FProgressPercent := AValor;
+    DibujaProgreso;
+    FProgressBox.Invalidate;
+    FProgressBox.Update;
+    Application.ProcessMessages;
+  end;
+
 begin
   if FEjecutando then
     Exit;
@@ -441,9 +501,7 @@ begin
   FFechaFin.Enabled := False;
 
   TotalDias := Trunc(FechaFin - FechaIni) + 1;
-  FProgress.Min := 0;
-  FProgress.Max := TotalDias;
-  FProgress.Position := 0;
+  ActualizaBarraProgreso(0);
 
   DiaActual := 0;
   Errores := 0;
@@ -470,12 +528,22 @@ begin
       end;
 
       Inc(DiaActual);
-      FProgress.Position := DiaActual;
+      Porcentaje := (DiaActual * 100) div TotalDias;
+      if DiaActual >= TotalDias then
+        Porcentaje := 100;
+      ActualizaBarraProgreso(Porcentaje);
       FLabelEstado.Caption := 'Procesadas '+IntToStr(DiaActual)+' de '+IntToStr(TotalDias)+' fechas.';
       Update;
       Application.ProcessMessages;
 
       FechaAct := FechaAct + 1;
+    end;
+
+    if not FCancela then begin
+      ActualizaBarraProgreso(100);
+      FLabelEstado.Caption := 'Procesadas '+IntToStr(DiaActual)+' de '+IntToStr(TotalDias)+' fechas.';
+      Update;
+      Application.ProcessMessages;
     end;
 
     if FCancela then
