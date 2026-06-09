@@ -785,6 +785,74 @@ begin
   end;
 end;
 
+procedure LiqApiLimpiaTokenCache;
+begin
+  EnterCriticalSection(GLiqApiTokenCS);
+  try
+    GLiqApiAccessTokenCache := '';
+    GLiqApiTokenTypeCache := 'Bearer';
+    GLiqApiTokenSolicitado := False;
+  finally
+    LeaveCriticalSection(GLiqApiTokenCS);
+  end;
+end;
+
+procedure LiqApiEnviarDetalleCombustibleHTTP(const AAccessToken, ATokenType,
+  AJsonLiquidacion: string; var AStatus: Integer; var ARespuesta: string);
+var
+  Url: string;
+  AuthHeader: string;
+begin
+  if Trim(AJsonLiquidacion) = '' then
+    raise Exception.Create('No hay JSON de detalle combustible para enviar a la API.');
+
+  Url := LiqApiRemoveTrailingSlash(LIQ_API_BASE_URL) +
+         '/api/legacy/Liquidacion/setdetallecombustible';
+
+  AuthHeader := LiqApiNormalizaTokenType(ATokenType) + ' ' + AAccessToken;
+
+  LiqApiHttpRequest('PUT', Url, AJsonLiquidacion, AuthHeader,
+    'application/json', AStatus, ARespuesta);
+end;
+
+function LiqApiEnviarDetalleCombustibleConToken(var AAccessToken, ATokenType: string;
+  const AJsonLiquidacion: string): Boolean;
+var
+  Status: Integer;
+  Resp: string;
+  Intento: Integer;
+begin
+  Result := False;
+
+  for Intento := 0 to 1 do begin
+    if Trim(AAccessToken) = '' then begin
+      if not LiqApiObtenerToken(AAccessToken, ATokenType) then
+        raise Exception.Create('No fue posible obtener el token para enviar el detalle combustible actualizado.');
+    end;
+
+    LiqApiEnviarDetalleCombustibleHTTP(AAccessToken, ATokenType,
+      AJsonLiquidacion, Status, Resp);
+
+    if (Status = 401) and (Intento = 0) then begin
+      LiqApiLimpiaTokenCache;
+      AAccessToken := '';
+      ATokenType := '';
+      Continue;
+    end;
+
+    if not (Status in [200, 201, 204]) then
+      raise Exception.Create('La API no regreso exito al enviar el detalle combustible actualizado. HTTP ' +
+        IntToStr(Status) + #13 + Resp);
+
+    if SameText(Trim(Resp), 'false') then
+      raise Exception.Create('La API respondio false al enviar el detalle combustible actualizado. HTTP ' +
+        IntToStr(Status) + #13 + Resp);
+
+    Result := True;
+    Exit;
+  end;
+end;
+
 function LiqApiStrToFloatDef(const S: string; const ADefault: Double): Double;
 var
   Tmp: string;
@@ -1381,7 +1449,8 @@ end;
 
 procedure TLiqApiConsultaLiqThread.EntregaResultado;
 var
-  jsonStr:TStringList;
+  AccessToken: string;
+  TokenType: string;
 begin
   if FFormulario = nil then
     Exit;
@@ -1394,17 +1463,12 @@ begin
       FFormulario.AplicarAjusteDGASAJUD2Json(FJson, FEstacion, FFechaTurno, 0);
       FFormulario.FJsonLiquidacionAPI := FJson;
 
-      ForceDirectories('C:\ImagenCo');
-      jsonStr:=TStringList.Create();
-      try
-        jsonStr.Add(FJson);
-        jsonStr.SaveToFile('C:\ImagenCo\JsonLiq_Ajud_Dia.txt');
-      finally
-        jsonStr.Free;
-      end;
+      AccessToken := '';
+      TokenType := '';
+      LiqApiEnviarDetalleCombustibleConToken(AccessToken, TokenType, FJson);
     except
       on E: Exception do
-        MensajeWarn('La fecha se bloqueo, pero no fue posible aplicar/consultar la liquidacion diaria en la API.' + #13 + E.Message);
+        MensajeWarn('La fecha se bloqueo, pero no fue posible aplicar/enviar la liquidacion diaria a la API.' + #13 + E.Message);
     end;
   finally
     if FFormulario <> nil then
@@ -1451,8 +1515,6 @@ var
   AccessToken: string;
   TokenType: string;
   JsonLiquidacion: string;
-  NombreArchivo: string;
-  JsonStr: TStringList;
 begin
   Result := False;
   AMensajeError := '';
@@ -1467,19 +1529,7 @@ begin
     AplicarAjusteDGASAJUD2Json(JsonLiquidacion, AEstacion, AFechaTurno, 0);
     FJsonLiquidacionAPI := JsonLiquidacion;
 
-    ForceDirectories('C:\ImagenCo');
-    if AGuardarConFecha then
-      NombreArchivo := 'C:\ImagenCo\JsonLiq_Ajud_Dia_' + FormatDateTime('yyyymmdd', AFechaTurno) + '.txt'
-    else
-      NombreArchivo := 'C:\ImagenCo\JsonLiq_Ajud_Dia.txt';
-
-    JsonStr := TStringList.Create;
-    try
-      JsonStr.Add(JsonLiquidacion);
-      JsonStr.SaveToFile(NombreArchivo);
-    finally
-      JsonStr.Free;
-    end;
+    LiqApiEnviarDetalleCombustibleConToken(AccessToken, TokenType, JsonLiquidacion);
 
     Result := True;
   except
