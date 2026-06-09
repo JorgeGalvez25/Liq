@@ -1027,6 +1027,7 @@ begin
   Result.Add('id', LiqApiJsonIntegerDef(AOrigen, 'id', 0));
   Result.Add('noTurno', LiqApiJsonIntegerDef(AOrigen, 'noTurno', 0));
   Result.Add('fechaTurno', LiqApiJsonStringDef(AOrigen, 'fechaTurno', ''));
+  Result.Add('importeLiq', LiqApiJsonDoubleDef(AOrigen, 'importeLiq', 0));
   Result.Add('detalleId', LiqApiJsonIntegerDef(AOrigen, 'detalleId', 0));
   Result.Add('diferencia', LiqApiJsonDoubleDef(AOrigen, 'diferencia', 0));
   Result.Add('devolucion', LiqApiJsonDoubleDef(AOrigen, 'devolucion', 0));
@@ -1173,185 +1174,322 @@ procedure TFLIQAJUD.AplicarAjusteDGASAJUD2Json(var AJsonLiquidacion: string;
 type
   TMangueraAjuste = record
     Obj: TlkJSONobject;
+    IdLiquidacion: Integer;
+    DetalleId: Integer;
     NoTurno: Integer;
     NoManguera: Integer;
-    PesoLitros: Double;
-    LitrosApi: Double;
+    NoCombustible: Integer;
+    DiferenciaBase: Double;
+    ImporteLiqProporcional: Double;
+  end;
+
+  TGrupoLiquidacionImporte = record
+    IdLiquidacion: Integer;
+    ImporteLiq: Double;
+    Mangueras: array of Integer;
+    SumaDiferenciaBase: Double;
   end;
 
   TGrupoCombustibleAjuste = record
     NoCombustible: Integer;
-    Mangueras: array of TMangueraAjuste;
-    VolumenTotal: Double;
-    SumaPesosLitros: Double;
-    SumaLitrosApi: Double;
+    AjusteTotal: Double;
+    Mangueras: array of Integer;
+    SumaImporteProporcional: Double;
   end;
 var
   JsonBase: TlkJSONbase;
-  Grupos: array of TGrupoCombustibleAjuste;
-  Modo: TModoRepartoAjuste;
+  Mangueras: array of TMangueraAjuste;
+  GruposLiq: array of TGrupoLiquidacionImporte;
+  GruposComb: array of TGrupoCombustibleAjuste;
 
-  function IndiceGrupo(const ANoCombustible: Integer): Integer;
+  function IndiceGrupoLiq(const AIdLiquidacion: Integer; const AImporteLiq: Double): Integer;
   var
     J: Integer;
   begin
-    for J := Low(Grupos) to High(Grupos) do begin
-      if Grupos[J].NoCombustible = ANoCombustible then begin
+    for J := Low(GruposLiq) to High(GruposLiq) do begin
+      if GruposLiq[J].IdLiquidacion = AIdLiquidacion then begin
+        // importeLiq viene repetido por cada manguera de la misma liquidacion.
+        // No se modifica el valor original del JSON; solo se usa el primero
+        // como importe total interno para calcular pesos proporcionales.
         Result := J;
         Exit;
       end;
     end;
 
-    Result := Length(Grupos);
-    SetLength(Grupos, Result + 1);
-    Grupos[Result].NoCombustible := ANoCombustible;
-    Grupos[Result].VolumenTotal := 0;
-    Grupos[Result].SumaPesosLitros := 0;
-    Grupos[Result].SumaLitrosApi := 0;
-    SetLength(Grupos[Result].Mangueras, 0);
+    Result := Length(GruposLiq);
+    SetLength(GruposLiq, Result + 1);
+    GruposLiq[Result].IdLiquidacion := AIdLiquidacion;
+    GruposLiq[Result].ImporteLiq := AImporteLiq;
+    GruposLiq[Result].SumaDiferenciaBase := 0;
+    SetLength(GruposLiq[Result].Mangueras, 0);
+  end;
+
+  function IndiceGrupoCombustible(const ANoCombustible: Integer): Integer;
+  var
+    J: Integer;
+  begin
+    for J := Low(GruposComb) to High(GruposComb) do begin
+      if GruposComb[J].NoCombustible = ANoCombustible then begin
+        Result := J;
+        Exit;
+      end;
+    end;
+
+    Result := Length(GruposComb);
+    SetLength(GruposComb, Result + 1);
+    GruposComb[Result].NoCombustible := ANoCombustible;
+    GruposComb[Result].AjusteTotal :=
+      DameMagnitudARepartirDGASAJUD2(AEstacion, AFechaTurno, ANoTurno, ANoCombustible);
+    GruposComb[Result].SumaImporteProporcional := 0;
+    SetLength(GruposComb[Result].Mangueras, 0);
+  end;
+
+  procedure AgregaMangueraAGrupoLiq(const AGrupoIndex, AMangueraIndex: Integer);
+  var
+    N: Integer;
+  begin
+    N := Length(GruposLiq[AGrupoIndex].Mangueras);
+    SetLength(GruposLiq[AGrupoIndex].Mangueras, N + 1);
+    GruposLiq[AGrupoIndex].Mangueras[N] := AMangueraIndex;
+  end;
+
+  procedure AgregaMangueraAGrupoComb(const AGrupoIndex, AMangueraIndex: Integer);
+  var
+    N: Integer;
+  begin
+    N := Length(GruposComb[AGrupoIndex].Mangueras);
+    SetLength(GruposComb[AGrupoIndex].Mangueras, N + 1);
+    GruposComb[AGrupoIndex].Mangueras[N] := AMangueraIndex;
   end;
 
   procedure RecolectaManguera(AObj: TlkJSONobject);
   var
+    IdLiquidacion: Integer;
+    NoTurnoJson: Integer;
     NoCombustible: Integer;
-    GrupoIndex: Integer;
+    GrupoLiqIndex: Integer;
+    GrupoCombIndex: Integer;
     MangueraIndex: Integer;
-    LitrosManguera: Double;
+    DiferenciaJson: Double;
+    ImporteLiq: Double;
   begin
     if not Assigned(AObj) then
       Exit;
 
-    // En ULIQAJUD el ajuste es diario. No se valida noTurno del JSON.
     if not LiqApiFechaJsonIgual(LiqApiJsonStringDef(AObj, 'fechaTurno', ''), AFechaTurno) then
+      Exit;
+
+    NoTurnoJson := LiqApiJsonIntegerDef(AObj, 'noTurno', 0);
+    if (ANoTurno <> 0) and (NoTurnoJson <> ANoTurno) then
+      Exit;
+
+    IdLiquidacion := LiqApiJsonIntegerDef(AObj, 'id', 0);
+    if IdLiquidacion <= 0 then
       Exit;
 
     NoCombustible := LiqApiJsonIntegerDef(AObj, 'noCombustible', 0);
     if NoCombustible <= 0 then
       Exit;
 
-    GrupoIndex := IndiceGrupo(NoCombustible);
-    MangueraIndex := Length(Grupos[GrupoIndex].Mangueras);
-    SetLength(Grupos[GrupoIndex].Mangueras, MangueraIndex + 1);
+    ImporteLiq := LiqApiJsonDoubleDef(AObj, 'importeLiq', 0);
+    DiferenciaJson := Abs(LiqApiJsonDoubleDef(AObj, 'diferencia', 0));
 
-    LitrosManguera := LiqApiLitrosManguera(AObj);
+    MangueraIndex := Length(Mangueras);
+    SetLength(Mangueras, MangueraIndex + 1);
 
-    Grupos[GrupoIndex].Mangueras[MangueraIndex].Obj := AObj;
-    Grupos[GrupoIndex].Mangueras[MangueraIndex].NoTurno :=
-      LiqApiJsonIntegerDef(AObj, 'noTurno', 0);
-    Grupos[GrupoIndex].Mangueras[MangueraIndex].NoManguera :=
-      LiqApiJsonIntegerDef(AObj, 'noManguera', 0);
-    Grupos[GrupoIndex].Mangueras[MangueraIndex].PesoLitros := LitrosManguera;
-    Grupos[GrupoIndex].Mangueras[MangueraIndex].LitrosApi := LitrosManguera;
+    Mangueras[MangueraIndex].Obj := AObj;
+    Mangueras[MangueraIndex].IdLiquidacion := IdLiquidacion;
+    Mangueras[MangueraIndex].DetalleId := LiqApiJsonIntegerDef(AObj, 'detalleId', 0);
+    Mangueras[MangueraIndex].NoTurno := NoTurnoJson;
+    Mangueras[MangueraIndex].NoManguera := LiqApiJsonIntegerDef(AObj, 'noManguera', 0);
+    Mangueras[MangueraIndex].NoCombustible := NoCombustible;
+    Mangueras[MangueraIndex].DiferenciaBase := DiferenciaJson;
+    Mangueras[MangueraIndex].ImporteLiqProporcional := 0;
+
+    GrupoLiqIndex := IndiceGrupoLiq(IdLiquidacion, ImporteLiq);
+    AgregaMangueraAGrupoLiq(GrupoLiqIndex, MangueraIndex);
+
+    GrupoCombIndex := IndiceGrupoCombustible(NoCombustible);
+    AgregaMangueraAGrupoComb(GrupoCombIndex, MangueraIndex);
   end;
 
-  // Orden estable por (NoTurno, NoManguera): True si A va antes que B.
-  // Centraliza el desempate del orden y de la manguera residual.
   function MangueraVaAntes(const A, B: TMangueraAjuste): Boolean;
   begin
-    Result := (A.NoTurno < B.NoTurno) or
-              ((A.NoTurno = B.NoTurno) and (A.NoManguera < B.NoManguera));
+    Result :=
+      (A.NoTurno < B.NoTurno) or
+      ((A.NoTurno = B.NoTurno) and (A.IdLiquidacion < B.IdLiquidacion)) or
+      ((A.NoTurno = B.NoTurno) and (A.IdLiquidacion = B.IdLiquidacion) and
+       (A.NoManguera < B.NoManguera)) or
+      ((A.NoTurno = B.NoTurno) and (A.IdLiquidacion = B.IdLiquidacion) and
+       (A.NoManguera = B.NoManguera) and (A.DetalleId < B.DetalleId));
   end;
 
-  procedure OrdenaManguerasPorNumero(var AGrupo: TGrupoCombustibleAjuste);
-  var
-    I, J: Integer;
-    Tmp: TMangueraAjuste;
-  begin
-    for I := 1 to High(AGrupo.Mangueras) do begin
-      Tmp := AGrupo.Mangueras[I];
-      J := I - 1;
-      while (J >= 0) and MangueraVaAntes(Tmp, AGrupo.Mangueras[J]) do begin
-        AGrupo.Mangueras[J + 1] := AGrupo.Mangueras[J];
-        Dec(J);
-      end;
-      AGrupo.Mangueras[J + 1] := Tmp;
-    end;
-  end;
-
-  function IndiceMangueraResidual(const AGrupo: TGrupoCombustibleAjuste): Integer;
+  function IndiceResidualGrupoLiq(const AGrupo: TGrupoLiquidacionImporte): Integer;
   var
     I: Integer;
+    IdxActual: Integer;
+    IdxMejor: Integer;
     EsMejor: Boolean;
   begin
-    Result := 0;
+    Result := -1;
+    if Length(AGrupo.Mangueras) <= 0 then
+      Exit;
+
+    IdxMejor := AGrupo.Mangueras[0];
     for I := 1 to High(AGrupo.Mangueras) do begin
-      // Mayor peso; a igualdad de peso, la manguera posterior en (turno, no).
+      IdxActual := AGrupo.Mangueras[I];
       EsMejor :=
-        (AGrupo.Mangueras[I].PesoLitros > AGrupo.Mangueras[Result].PesoLitros) or
-        ((AGrupo.Mangueras[I].PesoLitros = AGrupo.Mangueras[Result].PesoLitros) and
-         MangueraVaAntes(AGrupo.Mangueras[Result], AGrupo.Mangueras[I]));
+        (Mangueras[IdxActual].DiferenciaBase > Mangueras[IdxMejor].DiferenciaBase) or
+        ((Mangueras[IdxActual].DiferenciaBase = Mangueras[IdxMejor].DiferenciaBase) and
+         MangueraVaAntes(Mangueras[IdxMejor], Mangueras[IdxActual]));
       if EsMejor then
-        Result := I;
+        IdxMejor := IdxActual;
     end;
+
+    Result := IdxMejor;
   end;
 
-  procedure ReparteGrupo(var AGrupo: TGrupoCombustibleAjuste);
+  function PesoImporteProporcional(const AManguera: TMangueraAjuste): Double;
+  begin
+    Result := Abs(AManguera.ImporteLiqProporcional);
+  end;
+
+  function IndiceResidualGrupoComb(const AGrupo: TGrupoCombustibleAjuste): Integer;
+  var
+    I: Integer;
+    IdxActual: Integer;
+    IdxMejor: Integer;
+    PesoActual: Double;
+    PesoMejor: Double;
+    EsMejor: Boolean;
+  begin
+    Result := -1;
+    if Length(AGrupo.Mangueras) <= 0 then
+      Exit;
+
+    IdxMejor := AGrupo.Mangueras[0];
+    for I := 1 to High(AGrupo.Mangueras) do begin
+      IdxActual := AGrupo.Mangueras[I];
+      PesoActual := PesoImporteProporcional(Mangueras[IdxActual]);
+      PesoMejor := PesoImporteProporcional(Mangueras[IdxMejor]);
+      EsMejor :=
+        (PesoActual > PesoMejor) or
+        ((PesoActual = PesoMejor) and
+         MangueraVaAntes(Mangueras[IdxMejor], Mangueras[IdxActual]));
+      if EsMejor then
+        IdxMejor := IdxActual;
+    end;
+
+    Result := IdxMejor;
+  end;
+
+  procedure CalculaImporteProporcionalPorLiquidacion(var AGrupo: TGrupoLiquidacionImporte);
   var
     I: Integer;
     N: Integer;
-    IndiceResidual: Integer;
-    VolumenAsignado: Double;
-    VolumenManguera: Double;
+    Idx: Integer;
+    IdxResidual: Integer;
     Fraccion: Double;
+    ImporteManguera: Double;
+    ImporteAsignado: Double;
     UsaProporcional: Boolean;
   begin
     N := Length(AGrupo.Mangueras);
     if N <= 0 then
       Exit;
 
-    OrdenaManguerasPorNumero(AGrupo);
-
-    AGrupo.VolumenTotal := DameMagnitudARepartirDGASAJUD2(
-      AEstacion, AFechaTurno, 0, AGrupo.NoCombustible);
-
-    AGrupo.SumaPesosLitros := 0;
-    AGrupo.SumaLitrosApi := 0;
+    AGrupo.SumaDiferenciaBase := 0;
     for I := 0 to N - 1 do begin
-      AGrupo.SumaPesosLitros := AGrupo.SumaPesosLitros + AGrupo.Mangueras[I].PesoLitros;
-      AGrupo.SumaLitrosApi := AGrupo.SumaLitrosApi + AGrupo.Mangueras[I].LitrosApi;
+      Idx := AGrupo.Mangueras[I];
+      AGrupo.SumaDiferenciaBase := AGrupo.SumaDiferenciaBase + Mangueras[Idx].DiferenciaBase;
     end;
 
-    if LiqApiValidacionMagnitudActiva then
-      LiqApiValidaMagnitudVsApi(AGrupo.VolumenTotal, AGrupo.SumaLitrosApi,
-        AGrupo.NoCombustible);
-
-    UsaProporcional := (Modo = mraProporcional) and (Abs(AGrupo.SumaPesosLitros) > 0.0000001);
-    IndiceResidual := IndiceMangueraResidual(AGrupo);
-    VolumenAsignado := 0;
+    UsaProporcional := Abs(AGrupo.SumaDiferenciaBase) > 0.0000001;
+    IdxResidual := IndiceResidualGrupoLiq(AGrupo);
+    ImporteAsignado := 0;
 
     for I := 0 to N - 1 do begin
-      if I = IndiceResidual then
+      Idx := AGrupo.Mangueras[I];
+      if Idx = IdxResidual then
         Continue;
 
       if UsaProporcional then
-        Fraccion := AGrupo.Mangueras[I].PesoLitros / AGrupo.SumaPesosLitros
+        Fraccion := Mangueras[Idx].DiferenciaBase / AGrupo.SumaDiferenciaBase
       else
         Fraccion := 1 / N;
 
-      VolumenManguera := AGrupo.VolumenTotal * Fraccion;
-      VolumenAsignado := VolumenAsignado + VolumenManguera;
-      LiqApiAsignaDiferenciaLecturas2(AGrupo.Mangueras[I].Obj, VolumenManguera);
+      ImporteManguera := AGrupo.ImporteLiq * Fraccion;
+      Mangueras[Idx].ImporteLiqProporcional := ImporteManguera;
+      ImporteAsignado := ImporteAsignado + ImporteManguera;
     end;
 
-    LiqApiAsignaDiferenciaLecturas2(AGrupo.Mangueras[IndiceResidual].Obj,
-      AGrupo.VolumenTotal - VolumenAsignado);
+    if IdxResidual >= 0 then
+      Mangueras[IdxResidual].ImporteLiqProporcional := AGrupo.ImporteLiq - ImporteAsignado;
+  end;
+
+  procedure ReparteAjustePorCombustible(var AGrupo: TGrupoCombustibleAjuste);
+  var
+    I: Integer;
+    N: Integer;
+    Idx: Integer;
+    IdxResidual: Integer;
+    Fraccion: Double;
+    Peso: Double;
+    AjusteManguera: Double;
+    AjusteAsignado: Double;
+    UsaProporcional: Boolean;
+  begin
+    N := Length(AGrupo.Mangueras);
+    if N <= 0 then
+      Exit;
+
+    AGrupo.SumaImporteProporcional := 0;
+    for I := 0 to N - 1 do begin
+      Idx := AGrupo.Mangueras[I];
+      AGrupo.SumaImporteProporcional := AGrupo.SumaImporteProporcional +
+        PesoImporteProporcional(Mangueras[Idx]);
+    end;
+
+    UsaProporcional := Abs(AGrupo.SumaImporteProporcional) > 0.0000001;
+    IdxResidual := IndiceResidualGrupoComb(AGrupo);
+    AjusteAsignado := 0;
+
+    for I := 0 to N - 1 do begin
+      Idx := AGrupo.Mangueras[I];
+      if Idx = IdxResidual then
+        Continue;
+
+      if UsaProporcional then begin
+        Peso := PesoImporteProporcional(Mangueras[Idx]);
+        Fraccion := Peso / AGrupo.SumaImporteProporcional;
+      end
+      else
+        Fraccion := 1 / N;
+
+      AjusteManguera := AGrupo.AjusteTotal * Fraccion;
+      AjusteAsignado := AjusteAsignado + AjusteManguera;
+      LiqApiAsignaDiferenciaLecturas2(Mangueras[Idx].Obj, AjusteManguera);
+    end;
+
+    if IdxResidual >= 0 then
+      LiqApiAsignaDiferenciaLecturas2(Mangueras[IdxResidual].Obj,
+        AGrupo.AjusteTotal - AjusteAsignado);
   end;
 
 var
   I: Integer;
-  GrupoIndex: Integer;
 begin
   if Trim(AJsonLiquidacion) = '' then
     Exit;
 
-  Modo := LiqApiModoRepartoAjuste;
-
   JsonBase := TlkJSON.ParseText(AJsonLiquidacion);
   if not Assigned(JsonBase) then
-    raise Exception.Create('No fue posible parsear el JSON de liquidacion para aplicar DGASAJUD2.');
+    raise Exception.Create('No fue posible parsear el JSON de liquidacion para aplicar importeLiq como base de reparto.');
 
   try
-    SetLength(Grupos, 0);
+    SetLength(Mangueras, 0);
+    SetLength(GruposLiq, 0);
+    SetLength(GruposComb, 0);
 
     if JsonBase is TlkJSONlist then begin
       for I := 0 to JsonBase.Count - 1 do begin
@@ -1362,8 +1500,15 @@ begin
     else if JsonBase is TlkJSONobject then
       RecolectaManguera(TlkJSONobject(JsonBase));
 
-    for GrupoIndex := Low(Grupos) to High(Grupos) do
-      ReparteGrupo(Grupos[GrupoIndex]);
+    // Paso 1: repartir internamente importeLiq por liquidacion/isla (id),
+    // usando diferencia como base. Este importe proporcional NO se escribe al JSON.
+    for I := Low(GruposLiq) to High(GruposLiq) do
+      CalculaImporteProporcionalPorLiquidacion(GruposLiq[I]);
+
+    // Paso 2: repartir el ajuste real de DGASAJUD2 por combustible. El peso
+    // ahora es el importeLiq proporcional calculado en el paso anterior.
+    for I := Low(GruposComb) to High(GruposComb) do
+      ReparteAjustePorCombustible(GruposComb[I]);
 
     AJsonLiquidacion := TlkJSON.GenerateText(JsonBase);
   finally
@@ -1451,6 +1596,7 @@ procedure TLiqApiConsultaLiqThread.EntregaResultado;
 var
   AccessToken: string;
   TokenType: string;
+  jsonStr:TStringList;
 begin
   if FFormulario = nil then
     Exit;
@@ -1465,7 +1611,16 @@ begin
 
       AccessToken := '';
       TokenType := '';
-      LiqApiEnviarDetalleCombustibleConToken(AccessToken, TokenType, FJson);
+//      LiqApiEnviarDetalleCombustibleConToken(AccessToken, TokenType, FJson);
+
+      ForceDirectories('C:\ImagenCo');
+      jsonStr:=TStringList.Create();
+      try
+        jsonStr.Add(FJson);
+        jsonStr.SaveToFile('C:\ImagenCo\JsonLiq_Ajud_Dia.txt');
+      finally
+        jsonStr.Free;
+      end;
     except
       on E: Exception do
         MensajeWarn('La fecha se bloqueo, pero no fue posible aplicar/enviar la liquidacion diaria a la API.' + #13 + E.Message);
@@ -1515,6 +1670,8 @@ var
   AccessToken: string;
   TokenType: string;
   JsonLiquidacion: string;
+  NombreArchivo: string;
+  JsonStr: TStringList;
 begin
   Result := False;
   AMensajeError := '';
@@ -1529,7 +1686,21 @@ begin
     AplicarAjusteDGASAJUD2Json(JsonLiquidacion, AEstacion, AFechaTurno, 0);
     FJsonLiquidacionAPI := JsonLiquidacion;
 
-    LiqApiEnviarDetalleCombustibleConToken(AccessToken, TokenType, JsonLiquidacion);
+//    LiqApiEnviarDetalleCombustibleConToken(AccessToken, TokenType, JsonLiquidacion);
+
+    ForceDirectories('C:\ImagenCo');
+    if AGuardarConFecha then
+      NombreArchivo := 'C:\ImagenCo\JsonLiq_Ajud_Dia_' + FormatDateTime('yyyymmdd', AFechaTurno) + '.txt'
+    else
+      NombreArchivo := 'C:\ImagenCo\JsonLiq_Ajud_Dia.txt';
+
+    JsonStr := TStringList.Create;
+    try
+      JsonStr.Add(JsonLiquidacion);
+      JsonStr.SaveToFile(NombreArchivo);
+    finally
+      JsonStr.Free;
+    end;
 
     Result := True;
   except
