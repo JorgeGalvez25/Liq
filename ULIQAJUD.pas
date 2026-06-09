@@ -1451,6 +1451,9 @@ var
     end;
 
     UsaProporcional := Abs(AGrupo.SumaImporteProporcional) > 0.0000001;
+    if not UsaProporcional then
+      Exit;
+
     IdxResidual := IndiceResidualGrupoComb(AGrupo);
     AjusteAsignado := 0;
 
@@ -1459,13 +1462,11 @@ var
       if Idx = IdxResidual then
         Continue;
 
-      if UsaProporcional then begin
-        Peso := PesoImporteProporcional(Mangueras[Idx]);
-        Fraccion := Peso / AGrupo.SumaImporteProporcional;
-      end
-      else
-        Fraccion := 1 / N;
+      Peso := PesoImporteProporcional(Mangueras[Idx]);
+      if Peso <= 0.0000001 then
+        Continue;
 
+      Fraccion := Peso / AGrupo.SumaImporteProporcional;
       AjusteManguera := AGrupo.AjusteTotal * Fraccion;
       AjusteAsignado := AjusteAsignado + AjusteManguera;
       LiqApiAsignaDiferenciaLecturas2(Mangueras[Idx].Obj, AjusteManguera);
@@ -1611,7 +1612,7 @@ begin
 
       AccessToken := '';
       TokenType := '';
-//      LiqApiEnviarDetalleCombustibleConToken(AccessToken, TokenType, FJson);
+      LiqApiEnviarDetalleCombustibleConToken(AccessToken, TokenType, FJson);
 
       ForceDirectories('C:\ImagenCo');
       jsonStr:=TStringList.Create();
@@ -1686,7 +1687,7 @@ begin
     AplicarAjusteDGASAJUD2Json(JsonLiquidacion, AEstacion, AFechaTurno, 0);
     FJsonLiquidacionAPI := JsonLiquidacion;
 
-//    LiqApiEnviarDetalleCombustibleConToken(AccessToken, TokenType, JsonLiquidacion);
+    LiqApiEnviarDetalleCombustibleConToken(AccessToken, TokenType, JsonLiquidacion);
 
     ForceDirectories('C:\ImagenCo');
     if AGuardarConFecha then
