@@ -112,7 +112,10 @@ type
   public
     { Public declarations }
     destructor Destroy; override;
-    procedure PreparaForma;
+    procedure PreparaForma(const ALiqApiIdpBaseUrl: string = '';
+      const ALiqApiBaseUrl: string = '';
+      const ALiqApiUsername: string = '';
+      const ALiqApiPassword: string = '');
     procedure RefrescaTabla;
     procedure Totaliza;
   end;
@@ -137,10 +140,6 @@ uses DDMGEN, DDMGASQ, DDMGAS,
 const
   WINHTTP_OPTION_SECURE_PROTOCOLS = 9;
   WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 = $00000800;
-  LIQ_API_IDP_BASE_URL = 'https://idpautenticacionestaciondev.azurewebsites.net';
-  LIQ_API_BASE_URL = 'https://estaciondev.igas.mx';
-  LIQ_API_USERNAME = 'PL_8169_EXP_ES_2015';
-  LIQ_API_PASSWORD = '3g.SiM8&Z^z9';
   LIQ_API_TIMEOUT_RESOLVE = 5000;
   LIQ_API_TIMEOUT_CONNECT = 5000;
   LIQ_API_TIMEOUT_SEND    = 10000;
@@ -183,6 +182,10 @@ type
   end;
 
 var
+  LIQ_API_IDP_BASE_URL: string;
+  LIQ_API_BASE_URL: string;
+  LIQ_API_USERNAME: string;
+  LIQ_API_PASSWORD: string;
   GLiqApiAccessTokenCache: string;
   GLiqApiTokenTypeCache: string;
   GLiqApiTokenSolicitado: Boolean;
@@ -713,6 +716,21 @@ begin
     Result := 'Bearer';
 end;
 
+procedure LiqApiValidaConfiguracion;
+begin
+  if Trim(LIQ_API_IDP_BASE_URL) = '' then
+    raise Exception.Create('No se configuro LIQ_API_IDP_BASE_URL para la API de liquidaciones.');
+
+  if Trim(LIQ_API_BASE_URL) = '' then
+    raise Exception.Create('No se configuro LIQ_API_BASE_URL para la API de liquidaciones.');
+
+  if Trim(LIQ_API_USERNAME) = '' then
+    raise Exception.Create('No se configuro LIQ_API_USERNAME para la API de liquidaciones.');
+
+  if LIQ_API_PASSWORD = '' then
+    raise Exception.Create('No se configuro LIQ_API_PASSWORD para la API de liquidaciones.');
+end;
+
 function LiqApiSolicitarTokenAPI(var AAccessToken, ATokenType: string): Boolean;
 const
   CAMPOS_TOKEN: array[0..2] of string = ('access_token', 'token', 'id_token');
@@ -723,6 +741,8 @@ begin
   Result := False;
   AAccessToken := '';
   ATokenType := '';
+
+  LiqApiValidaConfiguracion;
 
   Url := LiqApiRemoveTrailingSlash(LIQ_API_IDP_BASE_URL) + '/auth/token';
   Body := 'username=' + LiqApiUrlEncode(LIQ_API_USERNAME) +
@@ -805,6 +825,8 @@ var
 begin
   if Trim(AJsonLiquidacion) = '' then
     raise Exception.Create('No hay JSON de detalle combustible para enviar a la API.');
+
+  LiqApiValidaConfiguracion;
 
   Url := LiqApiRemoveTrailingSlash(LIQ_API_BASE_URL) +
          '/api/legacy/Liquidacion/setdetallecombustible';
@@ -1117,6 +1139,8 @@ var
 begin
   Result := False;
   AJsonLiquidacion := '';
+
+  LiqApiValidaConfiguracion;
 
   Url := LiqApiRemoveTrailingSlash(LIQ_API_BASE_URL) +
          '/api/legacy/liquidacion/getdetallecombustible' +
@@ -1853,8 +1877,20 @@ begin
 end;
 
 
-procedure TFLIQAJUD.PreparaForma;
+procedure TFLIQAJUD.PreparaForma(const ALiqApiIdpBaseUrl,
+  ALiqApiBaseUrl, ALiqApiUsername, ALiqApiPassword: string);
 begin
+  if (LIQ_API_IDP_BASE_URL <> Trim(ALiqApiIdpBaseUrl)) or
+     (LIQ_API_BASE_URL <> Trim(ALiqApiBaseUrl)) or
+     (LIQ_API_USERNAME <> Trim(ALiqApiUsername)) or
+     (LIQ_API_PASSWORD <> ALiqApiPassword) then begin
+    LIQ_API_IDP_BASE_URL := Trim(ALiqApiIdpBaseUrl);
+    LIQ_API_BASE_URL := Trim(ALiqApiBaseUrl);
+    LIQ_API_USERNAME := Trim(ALiqApiUsername);
+    LIQ_API_PASSWORD := ALiqApiPassword;
+    LiqApiLimpiaTokenCache;
+  end;
+
   with DMGEN do begin
     SwBotonIns:=false;
     SwBotonDel:=false;
@@ -2265,6 +2301,10 @@ begin
 end;
 
 initialization
+  LIQ_API_IDP_BASE_URL := '';
+  LIQ_API_BASE_URL := '';
+  LIQ_API_USERNAME := '';
+  LIQ_API_PASSWORD := '';
   GLiqApiAccessTokenCache := '';
   GLiqApiTokenTypeCache := 'Bearer';
   GLiqApiTokenSolicitado := False;

@@ -413,11 +413,14 @@ procedure TModuloAuxiliarF.dxBarLargeButtonProcesosDiariosClick(
   Sender: TObject);
 begin
    Application.CreateForm(TFLIQAJUD,FLIQAJUD);
-  try
-    FLIQAJUD.PreparaForma;
-    FLIQAJUD.ShowModal;
-  finally
-    FLIQAJUD.Free;
+  with DMGEN do begin
+    try
+      FLIQAJUD.PreparaForma(VarComp('LIQ_API_IDP_BASE_URL'),VarComp('LIQ_API_BASE_URL'),
+                            VarComp('LIQ_API_USERNAME'),VarComp('LIQ_API_PASSWORD'));
+      FLIQAJUD.ShowModal;
+    finally
+      FLIQAJUD.Free;
+    end;
   end;
 end;
 
